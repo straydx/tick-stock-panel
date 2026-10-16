@@ -42,6 +42,8 @@ dependencies = [
     # Watchlist screenshot OCR (Tesseract)
     "pytesseract>=0.3.10",
     "Pillow>=10.0",
+    "eltdx>=3.2.3",
+    "axdata>=0.1.4",
 ]
 
 [project.optional-dependencies]
