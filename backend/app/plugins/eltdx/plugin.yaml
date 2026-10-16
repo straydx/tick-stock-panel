@@ -1,0 +1,20 @@
+# ELTDX — 通达信 7709 协议开源客户端插件 (https://github.com/electkismet/eltdx)
+# Rust 核心驱动的裸 TCP 协议客户端, runtime: python, 免费无需 API Key。
+# 提供 realtime(全市场快照)/daily(日K)/minute(分钟K)/depth5(五档盘口)/full_minute(全量分钟);
+# 除权因子与财务未接入, 自动回退 TickFlow。
+
+name: eltdx
+display_name: "ELTDX (通达信 7709)"
+runtime: python
+entry: app.plugins.eltdx.provider:EltdxProvider
+check: app.plugins.eltdx.provider:availability
+datasets: [realtime, daily, minute, depth5, full_minute]
+description: "ELTDX 通达信 7709 协议开源客户端(免费, Rust 核心, 无 API Key): 全市场实时快照、日K、分钟K、五档盘口、全量分钟; 除权因子/财务未接入, 自动回退 TickFlow。"
+install_hint: "依赖未内置; 需 pip install eltdx (或 uv add eltdx)"
+homepage: "https://github.com/electkismet/eltdx"
+usage_notes:
+  - "实时快照: 全市场 A 股(约 5580 只) + 指数, 单次批量拉取"
+  - "日K: count 模式单标的拉取, 原始价"
+  - "分钟K: 1m 单标的, 240 根/日"
+  - "五档盘口: 买/卖各 5 档价格与量(手), 供连板梯队真假封板判定"
+  - "全量分钟: 当日全天 1m 分钟(修复轮), 供盘中实时分时与分钟策略"

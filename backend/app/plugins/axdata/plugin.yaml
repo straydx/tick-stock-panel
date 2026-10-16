@@ -1,0 +1,17 @@
+# AxData — 多源量化数据库框架 (https://github.com/axjialong/axdata)
+# 统一多数据源的 DataFrame 接口, runtime: python, 免费无需 API Key。
+# 仅接入 daily(日K历史, pandas DataFrame 单标的模式); realtime 无全市场批量快照接口
+# (单标的逐只调用, 实测比 eltdx 慢 15-68 倍), 未接入, 自动回退 TickFlow。
+
+name: axdata
+display_name: "AxData (多源量化库)"
+runtime: python
+entry: app.plugins.axdata.provider:AxDataProvider
+check: app.plugins.axdata.provider:availability
+datasets: [daily]
+description: "AxData 多源量化数据库框架(免费, 无 API Key): 日K历史数据; 无全市场批量快照接口, 实时/分钟/盘口未接入, 自动回退 TickFlow。"
+install_hint: "依赖未内置; 需 pip install axdata (或 uv add axdata)"
+homepage: "https://github.com/axjialong/axdata"
+usage_notes:
+  - "日K: stock_kline_daily_tdx 单标的拉取, 返回 pandas DataFrame, 原始价"
+  - "股票池 stock_basic 需本地 parquet 核心表落盘, 首次使用需下载"
