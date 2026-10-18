@@ -50,6 +50,19 @@ for pkg in ("polars", "pyarrow", "duckdb", "fastexcel"):
     binaries += b
     hiddenimports += h
 
+# eltdx / axdata 数据源插件依赖 (均为函数内懒导入 `import eltdx`/`import axdata`,
+# 静态分析抓不到, 必须显式 collect)。eltdx 带 Rust 核心原生库 _native.pyd,
+# 必须 collect_all 连同 binaries 一起收, 否则 frozen 后 import eltdx 即失败;
+# axdata 是纯 Python, 依赖 axdata_core + axdata_source_* 多源适配包, collect_all 一并收。
+for pkg in ("eltdx", "axdata", "axdata_core", "axdata_source_cninfo",
+            "axdata_source_tdx", "axdata_source_tdx_ext", "axdata_source_tencent",
+            "requests", "urllib3", "idna", "charset_normalizer", "certifi"):
+    if find_spec(pkg) is not None:
+        d, b, h = collect_all(pkg)
+        datas += d
+        binaries += b
+        hiddenimports += h
+
 # tdxaidata (TdxQuant 插件依赖) — 后端对其全部懒导入, 必须显式声明:
 #   纯 Python 接口 (包 __init__ + tdxaidata.py) 进 PYZ; lib/ 是跨平台原生库
 #   合集 (win dll / mac dylib / linux so 同包), 运行时由 client.materialize_lib
@@ -84,6 +97,8 @@ hiddenimports += collect_submodules("polars")
 datas += [
     (str(ROOT / "backend" / "app" / "plugins" / "fuyao" / "plugin.yaml"), "app/plugins/fuyao"),
     (str(ROOT / "backend" / "app" / "plugins" / "tdxquant" / "plugin.yaml"), "app/plugins/tdxquant"),
+    (str(ROOT / "backend" / "app" / "plugins" / "eltdx" / "plugin.yaml"), "app/plugins/eltdx"),
+    (str(ROOT / "backend" / "app" / "plugins" / "axdata" / "plugin.yaml"), "app/plugins/axdata"),
 ]
 hiddenimports += [
     "app.plugins.fuyao.provider",
@@ -91,6 +106,8 @@ hiddenimports += [
     "app.plugins.tdxquant.provider",
     "app.plugins.tdxquant.client",
     "app.plugins.tdxquant.probe",
+    "app.plugins.eltdx.provider",
+    "app.plugins.axdata.provider",
 ]
 
 # ── 后端源码扩展 (app/custom/*) ──────────────────────────────────────
