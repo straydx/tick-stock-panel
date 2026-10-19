@@ -60,8 +60,16 @@ async function fetchJingjia(asOf?: string): Promise<JingjiaPayload> {
   return res.json() as Promise<JingjiaPayload>
 }
 
+async function fetchDates(): Promise<string[]> {
+  const res = await fetch('/api/custom/jingjia/dates')
+  if (!res.ok) return []
+  const j = (await res.json()) as { dates?: string[] }
+  return j.dates ?? []
+}
+
 function JingjiaPage() {
   const [query, setQuery] = useState('')
+  const [asOf, setAsOf] = useState<string>('')
   const [previewSymbol, setPreviewSymbol] = useState<string | null>(null)
   const [previewName, setPreviewName] = useState<string>('')
 
@@ -71,9 +79,16 @@ function JingjiaPage() {
   }, [])
 
   const q = useQuery({
-    queryKey: ['jingjia', 'select'],
-    queryFn: () => fetchJingjia(),
+    queryKey: ['jingjia', 'select', asOf],
+    queryFn: () => fetchJingjia(asOf || undefined),
     staleTime: 5 * 60_000,
+    retry: 1,
+  })
+
+  const datesQ = useQuery({
+    queryKey: ['jingjia', 'dates'],
+    queryFn: fetchDates,
+    staleTime: 10 * 60_000,
     retry: 1,
   })
 
@@ -112,8 +127,20 @@ function JingjiaPage() {
 
       {/* 统计条 */}
       <div className="flex shrink-0 flex-wrap items-center gap-2 px-5 pt-1">
-        <span className="rounded-full border border-border bg-elevated px-2.5 py-1 text-[11px] text-secondary">
-          选股日 <span className="font-mono font-semibold text-foreground">{data?.as_of ?? '—'}</span>
+        <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-elevated px-2.5 py-1 text-[11px] text-secondary">
+          选股日
+          <select
+            value={asOf || (data?.as_of ?? '')}
+            onChange={e => setAsOf(e.target.value)}
+            disabled={!data?.as_of && !datesQ.data?.length}
+            title="选择历史选股日回看"
+            className="cursor-pointer bg-transparent font-mono font-semibold text-foreground outline-none [&>option]:bg-background [&>option]:text-foreground"
+          >
+            <option value="">{data?.as_of ?? '—'}</option>
+            {(datesQ.data ?? []).map(d => (
+              <option key={d} value={d}>{d}</option>
+            ))}
+          </select>
         </span>
         <span className="rounded-full border border-border bg-elevated px-2.5 py-1 text-[11px] text-secondary">
           入选 <span className="font-mono font-semibold text-foreground">{data?.total ?? 0}</span> 只

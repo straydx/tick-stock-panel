@@ -577,6 +577,29 @@ def build_router():
 
     router = APIRouter(prefix="/api/custom/jingjia", tags=["custom-jingjia"])
 
+    @router.get("/dates")
+    async def dates(request: Request):
+        """可用选股日列表 (enriched 日K 已覆盖的交易日, 降序, 最多 60 个)。"""
+        repo = getattr(request.app.state, "repo", None)
+        if repo is None:
+            raise HTTPException(status_code=503, detail="数据仓库未就绪")
+        try:
+            rows = repo.execute_all(
+                "SELECT DISTINCT date FROM kline_enriched "
+                "ORDER BY date DESC LIMIT 60"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("获取选股日列表失败: %s", e)
+            raise HTTPException(status_code=500, detail=f"获取选股日列表失败: {e}")
+        out: list[str] = []
+        for r in rows or []:
+            d = r[0] if isinstance(r, (tuple, list)) else r
+            try:
+                out.append(str(d if not isinstance(d, date) else d.isoformat()))
+            except Exception:  # noqa: BLE001
+                continue
+        return {"dates": out}
+
     @router.get("/select")
     async def select(
         request: Request,
