@@ -13,7 +13,8 @@
 
 单位与口径 (CONTRIBUTING §3, 2026-10 实测):
   - 快照 total_hand 已是手, 直接透传(floor); amount 已是元。
-  - 快照无涨跌幅字段 → change_pct = (last-pre_close)/pre_close, 小数制。
+  - 快照 change_pct: SDK 的 QuoteSnapshot.change_pct 是百分制(*100), 不可直接透传;
+    本插件统一自算 change_pct = (last-pre_close)/pre_close, 小数制(与 tdxquant/fuyao 同口径)。
   - 日K volume_lots 已是手(带 .8 尾数 → floor); amount 已是元; time 带 +08:00 时区。
   - 分钟K point.volume 已是手(实测全天 sum = 日K volume_lots); datetime 北京墙钟。
   - 代码格式: eltdx 返回 'sh600000'/'sz000001' → 转 '600000.SH'/'000001.SZ'。
@@ -433,8 +434,13 @@ class EltdxProvider:
 def _map_snapshot(snap, fallback_ms: int) -> dict | None:
     """ELTDX QuoteSnapshot → 内部 realtime record。字段按口径透传, 不伪造。
 
-    实测 2026-10: change/change_pct 已是涨跌额(元)/涨跌幅(小数制), 直接透传;
-    total_hand 已是手, amount 已是元; full_code = 'sh689009' 用于归一化 symbol。
+    实测 2026-10: change 是涨跌额(元), 直接透传; total_hand 已是手, amount 已是元;
+    full_code = 'sh689009' 用于归一化 symbol。
+
+    注意: SDK 的 QuoteSnapshot.change_pct 是「百分制」(models/quote.py 里
+    change / pre_close * 100.0), 与内部小数制契约不符。这里不信任 SDK 的
+    change_pct, 改用 change_amount / prev 自算小数制(与 tdxquant/fuyao 同口径),
+    否则百分制值(如 19.99)会原样透传进 enriched, 前端再 ×100 放大成 +1999%。
     """
     last = _to_float(snap.last_price)
     prev = _to_float(snap.pre_close_price)
@@ -443,9 +449,9 @@ def _map_snapshot(snap, fallback_ms: int) -> dict | None:
     change_amount = _to_float(getattr(snap, "change", None))
     if change_amount is None and last is not None and prev is not None:
         change_amount = last - prev
-    change_pct = _to_float(getattr(snap, "change_pct", None))
-    if change_pct is None and change_amount is not None and prev:
-        change_pct = change_amount / prev
+    # 小数制, 不乘 100: 与 quote_service 推导及 tdxquant/fuyao 同口径。
+    # 不用 SDK 的 change_pct(百分制), 避免 100 倍污染。
+    change_pct = change_amount / prev if (change_amount is not None and prev) else None
 
     volume = _to_float(snap.total_hand)  # 已是手
     amount = _to_float(snap.amount)  # 已是元
