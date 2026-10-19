@@ -26,6 +26,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -52,6 +53,10 @@ _MINUTE_SCHEMA = {
 
 _HIST_INTERVAL_S = 0.05  # 单标的日K/分钟请求节流(本机协议, 无服务端限频, 可放宽)
 _MINUTE_BARS_PER_DAY = 240
+
+# 日K/分钟历史并发拉取线程数。eltdx TdxClient 线程安全(2026-10 回测脚本已
+# 16 线程共享单 client 跑通全市场), 16 并发可压满其连接池, 全市场日K约 10 分钟 → 1 分钟。
+_HIST_MAX_WORKERS = 16
 
 # 实测 2026-10: get_snapshots 单次最多返回 80 条(超出的请求被服务端截断到 80);
 # 超过约 1000 只直接 TCP 断流。故全市场快照按 80 只/批分批拉取。
@@ -235,19 +240,24 @@ class EltdxProvider:
         span = (end_d - start_d).days if start_d else 4000
         count = max(30, min(3000, int(span * 5 / 7) + 20))
 
-        for i, symbol in enumerate(symbols):
+        def _fetch_one(symbol: str) -> pl.DataFrame:
             code = _to_eltdx_code(symbol)
-            rows: list[dict] = []
-            if code is not None:
-                try:
-                    series = client.bars.get(code, period="day", count=count)
-                    rows = _kline_rows(symbol, series, start_d, end_d)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("ELTDX 日K %s 拉取失败: %s", symbol, e)
-            yield pl.DataFrame(rows, schema=_DAILY_SCHEMA)
-            if on_chunk_done:
-                on_chunk_done(i + 1, len(symbols))
-            time.sleep(_HIST_INTERVAL_S)
+            if code is None:
+                return pl.DataFrame(schema=_DAILY_SCHEMA)
+            try:
+                series = client.bars.get(code, period="day", count=count)
+                return pl.DataFrame(_kline_rows(symbol, series, start_d, end_d), schema=_DAILY_SCHEMA)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("ELTDX 日K %s 拉取失败: %s", symbol, e)
+                return pl.DataFrame(schema=_DAILY_SCHEMA)
+
+        total = len(symbols)
+        # 并发拉取(TdxClient 线程安全), map 保持结果与 symbols 顺序一致, 进度/顺序不变。
+        with ThreadPoolExecutor(max_workers=_HIST_MAX_WORKERS) as ex:
+            for i, df in enumerate(ex.map(_fetch_one, symbols), start=1):
+                yield df
+                if on_chunk_done:
+                    on_chunk_done(i, total)
 
     # ---- minute ----
     def get_minute(
