@@ -1,13 +1,12 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { QueryClient } from '@tanstack/react-query'
 import {
-  MINUTE_BATCH_CHUNK,
   MINUTE_CACHE_MAX_SYMBOLS,
   fetchMinuteBatchIncremental,
-  lastBarTs,
   mergeInto,
   pruneMinuteCache,
 } from './minuteBatchIncremental'
+import { getMinuteBatchChunkSize, resetKlineBatchLimits, setKlineBatchLimits } from './klineBatchLimits'
 import { QK } from './queryKeys'
 import { api } from './api'
 import type { MinuteKlineRow } from './api'
@@ -23,19 +22,7 @@ const bars = (times: string[]): MinuteKlineRow[] =>
 
 beforeEach(() => {
   vi.clearAllMocks()
-})
-
-describe('lastBarTs', () => {
-  it('取请求范围内最旧的最后一根', () => {
-    const data = {
-      a: bars(['09:31', '09:40']),
-      b: bars(['09:31', '09:35']),
-      c: bars(['09:31', '09:50']),
-    }
-    expect(lastBarTs(data, ['a', 'c'])).toBe('09:40')
-    expect(lastBarTs(data)).toBe('09:35')
-    expect(lastBarTs({}, ['a'])).toBeNull()
-  })
+  resetKlineBatchLimits()
 })
 
 describe('mergeInto', () => {
@@ -78,19 +65,35 @@ describe('pruneMinuteCache', () => {
 })
 
 describe('fetchMinuteBatchIncremental', () => {
-  it('按 300/块分块请求并合并, 块间 since 取自缓存对应块', async () => {
+  it('按偏好的单请求上限分块并合并, 块间 since 取自缓存对应块', async () => {
+    // 分块大小 = 后端校验的同一上限 (默认 400)。改设置后两端同步, 不会必然 400。
     const qc = new QueryClient()
-    const symbols = Array.from({ length: 651 }, (_, i) => `s${i}`)
+    const chunkSize = getMinuteBatchChunkSize()
+    const symbols = Array.from({ length: chunkSize * 2 + 51 }, (_, i) => `s${i}`)
     const mock = vi.mocked(api.klineMinuteBatch)
     mock.mockResolvedValue({ data: {}, incremental: true } as any)
 
     await fetchMinuteBatchIncremental(qc, symbols, true)
 
     expect(mock).toHaveBeenCalledTimes(3)
-    expect(mock.mock.calls[0][0]).toHaveLength(MINUTE_BATCH_CHUNK)
-    expect(mock.mock.calls[1][0]).toHaveLength(MINUTE_BATCH_CHUNK)
+    expect(mock.mock.calls[0][0]).toHaveLength(chunkSize)
+    expect(mock.mock.calls[1][0]).toHaveLength(chunkSize)
     expect(mock.mock.calls[2][0]).toHaveLength(51)
     expect(mock.mock.calls[0][2]).toBe(true)
+  })
+
+  it('偏好调小后分块立即跟随 (与后端同源, 不残留旧硬编码)', async () => {
+    const qc = new QueryClient()
+    setKlineBatchLimits({ minute: 120 })
+    const symbols = Array.from({ length: 250 }, (_, i) => `s${i}`)
+    const mock = vi.mocked(api.klineMinuteBatch)
+    mock.mockResolvedValue({ data: {}, incremental: true } as any)
+
+    await fetchMinuteBatchIncremental(qc, symbols, true)
+
+    expect(mock).toHaveBeenCalledTimes(3)
+    expect(mock.mock.calls[0][0]).toHaveLength(120)
+    expect(mock.mock.calls[2][0]).toHaveLength(10)
   })
 
   it('缓存存在时带 since, 增量合并为完整序列', async () => {
@@ -105,6 +108,47 @@ describe('fetchMinuteBatchIncremental', () => {
 
     expect(mock.mock.calls[0][3]).toBe('09:40')
     expect(out.data.a.map(r => r.datetime)).toEqual(['09:31', '09:40', '09:41'])
+  })
+
+  it('缓存只有 1 根残序列时自愈: 不带 since 全量重取 (手动刷新可恢复)', async () => {
+    // 历史遗留的 1 根残序列若不重取, since 恒为那一根 → 每轮只回 1 根, 永远画不出分时
+    const qc = new QueryClient()
+    qc.setQueryData(QK.minuteBatch(), {
+      data: { a: bars(['15:00']) },
+    })
+    const mock = vi.mocked(api.klineMinuteBatch)
+    mock.mockResolvedValue({ data: { a: bars(['09:31', '09:35', '15:00']) }, incremental: false } as any)
+
+    const out = await fetchMinuteBatchIncremental(qc, ['a'], true)
+
+    expect(mock.mock.calls[0][3]).toBeUndefined()   // 不带 since → 全天
+    expect(out.data.a).toHaveLength(3)
+  })
+
+  it('已缓存与未缓存 symbol 混合时按 since 拆成两请求 — 新 symbol 不能被裁成新增 (回归)', async () => {
+    // 真实 bug: 整块共用最旧末根作 since, 未缓存的新 symbol 只回 1 根
+    // → 分时图空白, 且手动点刷新也永远凑不满 2 根
+    const qc = new QueryClient()
+    qc.setQueryData(QK.minuteBatch(), {
+      data: { old: bars(['09:31', '09:40']) },
+    })
+    const mock = vi.mocked(api.klineMinuteBatch)
+    mock.mockImplementation(async (syms: string[]) =>
+      syms.includes('old')
+        ? { data: { old: bars(['09:41']) }, incremental: true } as any
+        : { data: { fresh: bars(['09:31', '09:35']) }, incremental: false } as any)
+
+    const out = await fetchMinuteBatchIncremental(qc, ['old', 'fresh'], true)
+
+    const withSince = mock.mock.calls.filter(c => c[3] != null)
+    const withoutSince = mock.mock.calls.filter(c => c[3] == null)
+    expect(withSince).toHaveLength(1)
+    expect(withSince[0][0]).toEqual(['old'])
+    expect(withSince[0][3]).toBe('09:40')
+    expect(withoutSince).toHaveLength(1)
+    expect(withoutSince[0][0]).toEqual(['fresh'])
+    // 新 symbol 拿到全天序列, 分时图可正常绘制
+    expect(out.data.fresh.map(r => r.datetime)).toEqual(['09:31', '09:35'])
   })
 
   it('无缓存时不带 since, 响应按 symbol 合并进同一份结果', async () => {

@@ -274,8 +274,19 @@ export function ListColumnCustomizerInner({
   })
   const backdrop = useDialogBackdrop(onClose)
 
-  // 多盘表识别用 ref 镜像 (schema 查询数据), 让 addExtColumn 保持稳定引用
-  const extTablesRef = useRef<readonly { id: string; time_field?: string | null }[]>([])
+  /** 时序扩展表的生效粒度: schema 透出值优先; 旧后端无该字段时退回 time_field 判定。
+ *  snapshot 表 (无历史分区) 与未知表 → null, 不提供序列形态配置。 */
+function extGranularityOf(
+  tables: readonly { id: string; mode?: string; time_field?: string | null; granularity?: 'intraday' | 'daily' | null }[],
+  configId: string,
+): 'intraday' | 'daily' | null {
+  const t = tables.find(x => x.id === configId)
+  if (!t || t.mode !== 'timeseries') return null
+  return t.granularity ?? (t.time_field ? 'intraday' : 'daily')
+}
+
+// 多盘表识别用 ref 镜像 (schema 查询数据), 让 addExtColumn 保持稳定引用
+  const extTablesRef = useRef<readonly { id: string; time_field?: string | null; granularity?: 'intraday' | 'daily' | null }[]>([])
   extTablesRef.current = extSchema.data?.items ?? []
 
   // columns/onChange 用 ref 镜像，让下方多数 useCallback 空依赖（addExtColumn 例外，
@@ -347,10 +358,11 @@ export function ListColumnCustomizerInner({
       toggleVisible(colId)
       return
     }
-    // 日内多盘表 (配置了时间列, 如集合竞价) 的数值列: 添加即默认分时式迷你图
-    // (与「分时」列同尺寸 150×80), 文字形态在列配置里按需切换
+    // 日内多盘表 (生效粒度 intraday, 如集合竞价) 的数值列: 添加即默认分时式迷你图
+    // (与「分时」列同尺寸 150×80), 文字形态在列配置里按需切换; 日级表默认文字值
     const multiSnapshot = !!extTablesRef.current.find(
-      t => t.id === configId && (t as { time_field?: string | null }).time_field,
+      t => t.id === configId
+        && (t.granularity === 'intraday' || (t.granularity == null && t.time_field)),
     )
     const newCol: ColumnConfig = {
       id: colId,
@@ -518,7 +530,12 @@ export function ListColumnCustomizerInner({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query])
 
-  const renderExtConfig = (col: ColumnConfig) => (
+  const renderExtConfig = (col: ColumnConfig) => {
+    const source = col.source
+    const table = source.type === 'ext' ? extTablesRef.current.find(t => t.id === source.configId) : undefined
+    const defaultGranularity = source.type === 'ext' ? extGranularityOf(extTables, source.configId) : null
+    const displayGranularity = defaultGranularity ? col.extDisplay?.seriesGranularity ?? defaultGranularity : null
+    return (
     <motion.div
       initial={{ height: 0, opacity: 0 }}
       animate={{ height: 'auto', opacity: 1 }}
@@ -621,8 +638,30 @@ export function ListColumnCustomizerInner({
             </div>
           </label>
         )}
-        {/* 日内多盘表 (配置了时间列, 如集合竞价): 选盘时刻 + 展示形态 */}
-        {col.source.type === 'ext' && (extTables.find(t => t.id === (col.source as { configId: string }).configId) as { time_field?: string | null } | undefined)?.time_field != null && (
+        {defaultGranularity && (
+          <div className="border-t border-border/40 pt-2 mt-1 space-y-1.5">
+            <label className="flex items-center gap-2 text-xs">
+              <span className="text-secondary w-16 shrink-0">显示周期</span>
+              <select
+                aria-label="显示周期"
+                value={col.extDisplay?.seriesGranularity ?? 'auto'}
+                onChange={e => updateExtDisplay(col.id, {
+                  seriesGranularity: e.target.value === 'auto' ? undefined : e.target.value as 'daily' | 'intraday',
+                })}
+                className="flex-1 min-w-0 h-7 rounded bg-elevated border border-border text-foreground text-xs px-2 focus:outline-none focus:border-accent/50"
+              >
+                <option value="auto">跟随数据表（当前按{defaultGranularity === 'daily' ? '日' : '日内'}）</option>
+                <option value="daily">按日（近 N 日，每天一值）</option>
+                <option value="intraday" disabled={!table?.time_field}>按日内（当天全部盘次）</option>
+              </select>
+            </label>
+            <p className="text-[10px] text-muted leading-relaxed">
+              仅影响本列展示，原始多盘记录保留。{!table?.time_field && '按日内展示需先在扩展数据拉取设置中配置时间字段。'}
+            </p>
+          </div>
+        )}
+        {/* 同一份多盘记录可按日或按日内读取, 不修改整表配置。 */}
+        {displayGranularity === 'intraday' && (
           <>
             <div className="border-t border-border/40 pt-2 mt-1 text-[10px] text-muted">日内多盘</div>
             <label className="flex items-center gap-2 text-xs">
@@ -650,7 +689,7 @@ export function ListColumnCustomizerInner({
                 <span className="text-[10px] text-muted shrink-0">留空=末盘</span>
               </label>
             ) : (
-              <div className="flex items-center gap-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
                 <label className="flex items-center gap-1">
                   <span className="text-secondary shrink-0">宽</span>
                   <RangeNumberInput
@@ -670,6 +709,55 @@ export function ListColumnCustomizerInner({
                   />
                 </label>
                 <span className="text-[10px] text-muted">px · 当天全序列</span>
+              </div>
+            )}
+          </>
+        )}
+        {displayGranularity === 'daily' && (
+          <>
+            <div className="border-t border-border/40 pt-2 mt-1 text-[10px] text-muted">日级序列</div>
+            <label className="flex items-center gap-2 text-xs">
+              <span className="text-secondary w-16 shrink-0">展示形态</span>
+              <select
+                value={col.extDisplay?.snapshotRender ?? 'text'}
+                onChange={e => updateExtDisplay(col.id, { snapshotRender: e.target.value as 'text' | 'bar' | 'line' })}
+                className="flex-1 h-7 rounded bg-elevated border border-border text-foreground text-xs px-2 focus:outline-none focus:border-accent/50"
+              >
+                <option value="bar">柱状图 (近N日每日值)</option>
+                <option value="line">折线图 (近N日)</option>
+                <option value="text">文字 (最新值)</option>
+              </select>
+            </label>
+            {(col.extDisplay?.snapshotRender ?? 'text') !== 'text' && (
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <label className="flex items-center gap-1">
+                  <span className="text-secondary shrink-0">天数</span>
+                  <RangeNumberInput
+                    value={col.extDisplay?.chartDays ?? 10}
+                    min={3} max={60} step={1}
+                    onCommit={v => updateExtDisplay(col.id, { chartDays: v })}
+                    className="w-16 h-7 rounded bg-elevated border border-border text-foreground text-xs px-2 text-center focus:outline-none focus:border-accent/50"
+                  />
+                </label>
+                <label className="flex items-center gap-1">
+                  <span className="text-secondary shrink-0">宽</span>
+                  <RangeNumberInput
+                    value={col.extDisplay?.chartWidth ?? 150}
+                    min={60} max={300} step={10}
+                    onCommit={v => updateExtDisplay(col.id, { chartWidth: v })}
+                    className="w-16 h-7 rounded bg-elevated border border-border text-foreground text-xs px-2 text-center focus:outline-none focus:border-accent/50"
+                  />
+                </label>
+                <label className="flex items-center gap-1">
+                  <span className="text-secondary shrink-0">高</span>
+                  <RangeNumberInput
+                    value={col.extDisplay?.chartHeight ?? 80}
+                    min={24} max={160} step={4}
+                    onCommit={v => updateExtDisplay(col.id, { chartHeight: v })}
+                    className="w-16 h-7 rounded bg-elevated border border-border text-foreground text-xs px-2 text-center focus:outline-none focus:border-accent/50"
+                  />
+                </label>
+                <span className="text-[10px] text-muted">px · 近N日全序列</span>
               </div>
             )}
           </>
@@ -730,7 +818,8 @@ export function ListColumnCustomizerInner({
         )}
       </div>
     </motion.div>
-  )
+    )
+  }
 
   // 策略列配置（精简版：仅显示数量/位置/排列方向，复用 extDisplay 存储）
   const renderStrategiesConfig = (col: ColumnConfig) => (
@@ -1305,9 +1394,9 @@ export function ListColumnCustomizerInner({
             className="relative w-[900px] max-w-[94vw] max-h-[min(720px,82vh)] bg-base border border-border rounded-card shadow-2xl flex flex-col overflow-hidden"
           >
             {/* 头部: 标题 + 全局搜索 + 已选计数 + 关闭 */}
-            <div className="flex items-center gap-3 px-4 py-2.5 border-b border-border shrink-0">
+            <div className="flex flex-wrap sm:flex-nowrap items-center gap-3 px-4 py-2.5 border-b border-border shrink-0">
               <h3 className="text-sm font-medium text-foreground shrink-0">{title}</h3>
-              <div className="relative flex-1 max-w-[300px]">
+              <div className="relative order-last sm:order-none basis-full sm:basis-auto flex-1 min-w-0 sm:max-w-[300px]">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted" />
                 <input
                   type="text"
@@ -1317,17 +1406,17 @@ export function ListColumnCustomizerInner({
                   className="w-full h-8 pl-8 pr-3 rounded-lg bg-elevated border border-border text-xs text-foreground placeholder:text-muted focus:outline-none focus:border-accent/50 transition-colors"
                 />
               </div>
-              <span className="ml-auto text-[10px] text-muted tabular-nums shrink-0">已选 {activeCols.length} 列</span>
+              <span className="hidden sm:inline ml-auto text-[10px] text-muted tabular-nums shrink-0">已选 {activeCols.length} 列</span>
               {baselineStore && (
                 <button
                   onClick={saveAsBaseline}
-                  className="shrink-0 h-7 px-2.5 rounded-btn bg-elevated border border-border text-[11px] text-secondary hover:text-foreground hover:border-accent/50 transition-colors"
+                  className="ml-auto sm:ml-0 shrink-0 h-7 px-2.5 rounded-btn bg-elevated border border-border text-[11px] text-secondary hover:text-foreground hover:border-accent/50 transition-colors"
                   title="把当前列配置存为默认方案；之后「恢复默认」回到这份设置"
                 >
                   {baselineSavedAt && Date.now() - baselineSavedAt < 2000 ? '✓ 已保存' : '保存为默认方案'}
                 </button>
               )}
-              <button onClick={onClose} className="p-1 rounded hover:bg-elevated text-muted hover:text-foreground transition-colors shrink-0">
+              <button onClick={onClose} aria-label="关闭列设置" className="p-1 rounded hover:bg-elevated text-muted hover:text-foreground transition-colors shrink-0">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -1335,9 +1424,9 @@ export function ListColumnCustomizerInner({
             {/* 两栏: 左=所有可选列, 右=已选择 (配置在已选行下方就地展开)。
                 弹窗高度自适应内容: min-h 下限防列少时过扁, 超过 max-h 时本行
                 收缩、两栏列表各自滚动。 */}
-            <div className="flex-1 flex min-h-[260px]">
+            <div className="flex-1 flex flex-col sm:flex-row min-h-[260px]">
               {/* ── 左栏: 所有列 ── */}
-              <div className="w-[340px] shrink-0 border-r border-border flex flex-col min-h-0 bg-surface/20">
+              <div className="w-full sm:w-[340px] max-h-40 sm:max-h-none shrink-0 border-b sm:border-b-0 sm:border-r border-border flex flex-col min-h-0 bg-surface/20">
                 <div className="flex items-center justify-between px-3 py-1.5 border-b border-border/50 shrink-0">
                   <span className="text-[10px] font-semibold text-muted uppercase tracking-wider">{builtinSectionLabel}</span>
                   <span className="text-[10px] text-muted">勾选即加入</span>

@@ -7,7 +7,9 @@ import { ToastContainer, toast } from '@/components/Toast'
 import { AlertToastContainer } from '@/components/AlertToast'
 import { AiAnalysisHost } from '@/components/financials/AiAnalysisHost'
 import { AiReportBubble } from '@/components/financials/AiReportBubble'
+import { DailyDataHealthNotice } from '@/components/data/DailyDataHealthNotice'
 import { StockAnalysisHost } from '@/components/stock-analysis/StockAnalysisHost'
+import { StockPreviewHost } from '@/components/StockPreviewHost'
 import { StockAnalysisBubble } from '@/components/stock-analysis/StockAnalysisBubble'
 import {
   useCapabilityMatrix,
@@ -20,8 +22,10 @@ import { useUpdateCheck } from '@/lib/updateCheck'
 import {
   useToggleRealtimeQuotes,
 } from '@/lib/useSharedMutations'
-import { QK } from '@/lib/queryKeys'
+import { QK, MINUTE_DATA_QUERY_PREFIXES } from '@/lib/queryKeys'
+import { setUiPref } from '@/lib/uiPrefs'
 import { getPageScale } from '@/lib/pageZoom'
+import { setKlineBatchLimits } from '@/lib/klineBatchLimits'
 import { compareByDefaultNav, defaultNavIndex, seedHiddenForNewUser } from '@/lib/navOrder'
 import {
   Settings,
@@ -374,6 +378,13 @@ export function Layout() {
   const update = useUpdateCheck()
   const hasUpdate = update.status === 'found'
   const { data: prefs } = usePreferences()
+  // 批量端点单请求上限 = 前端分块大小 (与后端校验同源, 见 lib/klineBatchLimits)。
+  // 在渲染期写入而非 effect: 分块助手在子组件 queryFn 内调用, 而 queryFn 早于
+  // 父组件 effect 触发 —— 用 effect 会让首轮请求仍按默认值分块。幂等, 无状态更新。
+  setKlineBatchLimits({
+    daily: prefs?.daily_batch_symbols,
+    minute: prefs?.minute_batch_symbols,
+  })
   // 数据源列表 (用于实时行情状态显示当前数据源名称)
   const { data: dataSources } = useQuery({
     queryKey: QK.dataSources,
@@ -418,7 +429,7 @@ export function Layout() {
   const overlayTimer = useRef<number | undefined>(undefined)
   const setNavStatePersist = (s: NavState) => {
     setNavState(s)
-    try { localStorage.setItem('tf-nav-state', s) } catch {}
+    try { setUiPref('tf-nav-state', s) } catch {}
   }
   // 图标条形态仅桌面 rail 态成立 (移动端抽屉与 overlay 预览恒为完整形态)
   const railMode = isDesktop && navState === 'rail'
@@ -483,6 +494,17 @@ export function Layout() {
   }, [isDataSyncing])
 
   const qc = useQueryClient()
+  const latestDataJob = pipelineJobs?.jobs?.[0]
+  const refreshedMinuteJob = useRef<string | null>(null)
+  useEffect(() => {
+    if (!latestDataJob || !['succeeded', 'failed'].includes(latestDataJob.status)) return
+    if (latestDataJob.result?.minute_rows == null && !['sync_minute', 'extend_minute'].includes(latestDataJob.stage)) return
+    if (refreshedMinuteJob.current === latestDataJob.id) return
+    refreshedMinuteJob.current = latestDataJob.id
+    // 复用常驻的任务轮询, 离开数据页后补拉结束也会刷新; 取消/失败可能已写入部分数据。
+    qc.invalidateQueries({ predicate: q => MINUTE_DATA_QUERY_PREFIXES.has(String(q.queryKey[0])) })
+    qc.invalidateQueries({ queryKey: QK.dataStatus })
+  }, [latestDataJob?.id, latestDataJob?.status, qc])
   const navigate = useNavigate()
   const version = versionData?.version
   const realtimeEnabled = prefs?.realtime_quotes_enabled ?? false
@@ -658,6 +680,8 @@ export function Layout() {
     const fresh = await qc.fetchQuery({
       queryKey: QK.quoteStatus,
       queryFn: api.quoteStatus,
+      // 刚切换到 fuyao 等源时, 全局 staleTime 内仍可能缓存旧源的权限。
+      staleTime: 0,
     })
     if (!fresh.realtime_allowed) {
       toast('当前数据源无实时行情能力, 请先配置数据源', 'error')
@@ -1136,6 +1160,7 @@ export function Layout() {
             与服务连接已断开 · 正在重连
           </div>
         )}
+        <DailyDataHealthNotice />
         <Suspense
           fallback={
             <div className="flex items-center justify-center py-24">
@@ -1152,6 +1177,7 @@ export function Layout() {
       <AiReportBubble />
       <StockAnalysisHost />
       <StockAnalysisBubble />
+      <StockPreviewHost />
 
       {/* 开启实时行情 + 排队中的挖掘任务 → 冲突确认 */}
       {miningQueuedWarning != null && (
