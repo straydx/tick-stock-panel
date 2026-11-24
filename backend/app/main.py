@@ -16,9 +16,11 @@ from app.api import (
     alerts,
     analysis,
     backtest,
+    chart_indicators,
     config_backup,
     data,
     definitions,
+    engine_jobs,
     events,
     ext_data,
     ext_pages,
@@ -46,6 +48,7 @@ from app.api import (
     signals,
     stock_analysis,
     strategy,
+    strategy_pool,
     task_registry,
     watchlist,
 )
@@ -139,11 +142,11 @@ async def _application_lifespan(app: FastAPI):
         logger.warning("signal seeding failed (ignored): %s", e)
     # 自定义/复合因子载入注册表 (P3); 单个失败只跳过该因子 (fail-隔离)
     with startup_phase(logger, "custom factor module import"):
-        from app.factors.store import load_into_registry
+        from app.factors.store import load_runtime_registry
 
     try:
         with startup_phase(logger, "custom factor registration"):
-            loaded_factors = load_into_registry(store.data_dir)
+            loaded_factors = load_runtime_registry(store.data_dir)
         if loaded_factors:
             logger.info("custom factors loaded: %s", len(loaded_factors))
     except Exception as exc:  # noqa: BLE001
@@ -492,9 +495,19 @@ async def _application_lifespan(app: FastAPI):
         current_extension_context(data_dir=store.data_dir, repository=repo),
         extension_registry,
     )
+    from app.services.engine_jobs.manager import EngineJobManager
+
+    try:
+        app.state.engine_job_manager = EngineJobManager(store.data_dir)
+    except Exception:  # noqa: BLE001 — optional engine service failure must not disable the host
+        app.state.engine_job_manager = None
+        logger.error("独立引擎任务服务启动失败，已有功能继续运行", exc_info=False)
     try:
         yield
     finally:
+        engine_manager = getattr(app.state, "engine_job_manager", None)
+        if engine_manager and not engine_manager.shutdown():
+            logger.warning("独立引擎任务进程尚未退出，保留执行锁")
         repo._on_refresh_done = None  # noqa: SLF001
         wd = getattr(app.state, "watchdog", None)
         if wd:
@@ -690,6 +703,7 @@ async def auth_middleware(request: Request, call_next):
 app.include_router(core_router)
 app.include_router(auth_api.router)
 app.include_router(kline.router)
+app.include_router(chart_indicators.router)
 app.include_router(watchlist.router)
 app.include_router(screener.router)
 app.include_router(backtest.router)
@@ -712,12 +726,14 @@ app.include_router(data.router)
 app.include_router(ext_data.router)
 app.include_router(ext_pages.router)
 app.include_router(task_registry.router)
+app.include_router(engine_jobs.router)
 app.include_router(financials.router)
 app.include_router(stock_analysis.router)
 app.include_router(market_recap.router)
 app.include_router(settings_api.router)
 app.include_router(upgrade_guard_api.router)
 app.include_router(strategy.router)
+app.include_router(strategy_pool.router)
 app.include_router(signals.router)
 app.include_router(monitor_rules.router)
 app.include_router(config_backup.router)

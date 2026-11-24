@@ -5,7 +5,9 @@ from collections.abc import Collection, Mapping
 from typing import Any
 
 import polars as pl
+from tivelo_backtest.research.scoring import scoring_value_expr as research_scoring_value_expr
 
+from app.factors.registry import factor_calculation_order, factor_warmup_bars
 from app.factors.registry import (
     factor_dependencies as _registry_factor_dependencies,
 )
@@ -50,19 +52,7 @@ def effective_scoring_directions(overrides: Mapping[str, Any] | None) -> dict[st
 
 
 def scoring_warmup_bars(scoring: Mapping[str, Any]) -> int:
-    warmups: list[int] = [
-        _ROLLING_SCORING_WARMUP.get(str(name), 1)
-        for name, weight in scoring.items()
-        if weight
-    ]
-    # composite/custom 因子的预热来自注册表 (P3)
-    for name, weight in scoring.items():
-        if not weight:
-            continue
-        spec = _registry_get_factor(str(name))
-        if spec is not None and spec.kind in ("custom", "composite"):
-            warmups.append(spec.warmup_bars)
-    return max(warmups, default=1)
+    return factor_warmup_bars(name for name, weight in scoring.items() if weight)
 
 
 def scoring_dependencies(scoring: Mapping[str, Any]) -> set[str]:
@@ -108,6 +98,8 @@ def scoring_value_expr(columns: Collection[str], name: str) -> pl.Expr | None:
     dependencies = VIRTUAL_SCORING_DEPENDENCIES.get(name)
     if dependencies is None or not dependencies.issubset(available):
         return None
+    if name in {"vwap_bias", "log_float_mv"}:
+        return research_scoring_value_expr(available, name)
     if name.startswith("ma") and name.endswith("_bias"):
         period = name.removeprefix("ma").removesuffix("_bias")
         if period.isdigit():
@@ -186,9 +178,6 @@ def scoring_value_expr(columns: Collection[str], name: str) -> pl.Expr | None:
             .otherwise(None)
             .over("symbol")
         )
-    if name == "vwap_bias":
-        vwap = _ratio(pl.col("amount"), pl.col("volume") * 100.0)
-        return _relative(pl.col("close"), vwap)
     if name == "vol_trend_5_60":
         fast = pl.col("volume").rolling_mean(5)
         slow = pl.col("volume").rolling_mean(60)
@@ -198,13 +187,6 @@ def scoring_value_expr(columns: Collection[str], name: str) -> pl.Expr | None:
         hit = (pl.col("consecutive_limit_ups").fill_null(0) > 0).cast(pl.Float64)
         return hit.rolling_sum(window, min_samples=window).over("symbol")
     # ── 扩充批次 (2026-09-05): 全部滚动窗口默认 min_samples=窗口长 (fail-closed) ──
-    if name == "log_float_mv":
-        # 换手率 = 成交量/流通股本 → 股本 = volume/turnover_rate, 市值 = close x 股本
-        return (
-            pl.when((pl.col("turnover_rate") > 0) & (pl.col("volume") > 0))
-            .then((pl.col("close") * pl.col("volume") / pl.col("turnover_rate")).log())
-            .otherwise(None)
-        )
     if name == "momentum_120d":
         return _relative(
             pl.col("close"),
@@ -288,6 +270,23 @@ def materialize_scoring_columns(
     frame: pl.DataFrame,
     names: Collection[str],
 ) -> pl.DataFrame:
+    requested = set(names)
+    # 按依赖层批算, 同层仍共享批量缓存命中/列附着。中间列仅在本次求值中可见。
+    depths: dict[str, int] = {}
+    layers: dict[int, list[str]] = {}
+    for name in factor_calculation_order(requested - set(frame.columns)):
+        spec = _registry_get_factor(name)
+        if name in frame.columns or spec is None or spec.kind == "base":
+            continue
+        depth = 1 + max((depths.get(dep, 0) for dep in spec.inputs), default=0)
+        depths[name] = depth
+        layers.setdefault(depth, []).append(name)
+    for layer in layers.values():
+        frame = _materialize_scoring_layer(frame, layer)
+    return frame.drop(depths.keys() - requested, strict=False)
+
+
+def _materialize_scoring_layer(frame: pl.DataFrame, names: Collection[str]) -> pl.DataFrame:
     # custom (DSL) 因子先物化: frame_transform 可能需要多阶段临时列 (嵌套窗口规避),
     # 与单表达式路径不同, 必须整体走帧变换 —— 与检验/试算共用同一条计算路径 (P3)。
     # P2b: 物化结果走内容寻址缓存 (键 = 定义 + 依赖列内容), 重复求值零成本;
@@ -314,7 +313,7 @@ def materialize_scoring_columns(
             continue
         key = cache_key(
             str(name), spec.formula_text, spec.version, frame,
-            set(spec.dependencies) | set(compiled.referenced_factors),
+            spec.inputs | ({"symbol", "date"} & set(frame.columns)),
         )
         if key is not None:
             cached = get_cached(key, frame.height)

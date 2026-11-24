@@ -4,6 +4,12 @@
 // Prod:同源(FastAPI 托管前端 dist)
 
 import { toast } from '@/components/Toast'
+import type { NavLayout } from './navLayout'
+import type { StockInfoBarLayout } from './stock-info-fields'
+import type { ChartIndicatorDefinition, ChartIndicatorLibrary, IndicatorEvaluation, IndicatorEvaluationRequest, IndicatorImportPreview, IndicatorLibraryResponse, IndicatorPackage } from './custom-chart-indicators'
+import type { EngineCalendarPreset, EngineInputCatalog, EngineJobPlan, EngineJobPreview, EngineJobRecord, EngineJobRequest, EngineResearchReport, EngineScheduleCalendar, EngineScheduleDelivery, EngineScheduleRecord, EngineScheduleRequest, EngineSnapshotSummary } from './engineJobTypes'
+import type { EnginePriceChoice, EnginePriceVariant } from './engineJobTypes'
+export type { EngineJobPlan, EngineJobRecord, EngineJobRequest, EngineResearchReport } from './engineJobTypes'
 
 const BASE = ''
 
@@ -95,7 +101,7 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
       } else if (typeof raw === 'string') {
         detail = raw
       } else if (raw && typeof raw === 'object') {
-        detail = JSON.stringify(raw)
+        detail = typeof raw.message === 'string' ? raw.message : JSON.stringify(raw)
       }
     } catch { /* ignore */ }
     const msg = detail || `${res.status} ${res.statusText}`
@@ -268,6 +274,7 @@ export interface MinuteKlineRow {
 
 export interface MinuteKlineSession {
   date: string
+  partial?: boolean
   prev_close: number | null
   rows: MinuteKlineRow[]
 }
@@ -433,6 +440,7 @@ export interface ScreenerStrategy {
   source?: string
   /** 支持的周期, 如 ['1d'] / ['1m'] (分钟策略) */
   timeframes?: string[]
+  library?: StrategyLibraryInfo | null
 }
 
 export interface StrategyLoadError {
@@ -908,6 +916,7 @@ export interface StrategyDetail {
   tags: string[]
   source: 'custom' | 'ai' | 'composite'
   research_only?: boolean
+  library?: StrategyLibraryInfo | null
   execution_backend: 'polars_expr' | 'matrix_native' | 'python_history_legacy' | 'composite' | 'minute_filter'
   asset_types: string[]
   timeframes: string[]
@@ -938,6 +947,37 @@ export interface StrategyDetail {
 
 export type ScoringDirection = 'high' | 'low'
 
+// ===== Strategy Pool v2 (池成员 + 策略库分组/归档) =====
+
+export interface StrategyPoolGroup {
+  id: string
+  name: string
+}
+
+/** 策略库元数据 — 库级属性, 与是否在池中无关 */
+export interface StrategyLibraryMeta {
+  /** 自定义分组; null = 未分组 (「自定义/AI/叠加」是来源分类, 不在此) */
+  group: string | null
+  /** 已归档 (可逆): 策略库与选择器隐藏, 同时移出池 */
+  archived: boolean
+  archived_at: string | null
+  /** 加入时间 (策略保存/首次被引擎看到时登记; 排序依据) */
+  added_at: string | null
+}
+
+export interface StrategyLibraryInfo extends StrategyLibraryMeta {
+  group_name: string | null
+}
+
+export interface StrategyPoolSnapshot {
+  /** 旧服务/测试快照允许缺失; 新服务用它丢弃晚到的旧响应。 */
+  revision?: number
+  groups: StrategyPoolGroup[]
+  /** 参与扫描的策略 ID 有序列表 (纯顺序, 不带属性) */
+  pool: string[]
+  meta: Record<string, StrategyLibraryMeta>
+}
+
 export interface StrategyBuildResult {
   code: string
   meta: Record<string, any>
@@ -965,6 +1005,7 @@ export interface StrategyCodeSaveResult {
 export interface AiIterateRound {
   round: number
   stats: Record<string, number> | null
+  backtest_error?: string | null
   change_summary: string
 }
 
@@ -994,6 +1035,11 @@ export interface CustomSignal {
   min_bars?: number
   /** 显式输出列名 (缺省 csg_{id}); 迁移自内置的定义沿用 signal_* 原列名, 编辑保存须原样回传 */
   column?: string
+  /** 已归档 (可逆): 信号库/选择器隐藏, 但仍照常编译注入, 引用它的策略不受影响 */
+  archived?: boolean
+  archived_at?: string | null
+  /** 创建时间 (旧定义可能缺失 → undefined, 排序时回退名称) */
+  created_at?: string | null
 }
 
 export interface CustomSignalFieldGroup {
@@ -1473,6 +1519,7 @@ export interface FactorColumn {
   label: string
   group: string
   desc: string
+  archived?: boolean
 }
 
 // ===== Factor Library (注册表, P1) =====
@@ -1494,6 +1541,8 @@ export interface FactorLibraryItem {
   stability: FactorStability
   /** 完整生命周期状态; 内置因子无盘上定义 → null (stability 是它的二元投影) */
   status: 'draft' | 'active' | 'watch' | 'retired' | null
+  /** 已归档 (可逆): 不再出现在因子库/选择器, 但注册表照常计算, 引用方不受影响 */
+  archived: boolean
   scale_free: boolean
   dependencies: string[]
 }
@@ -1952,6 +2001,8 @@ export interface BacktestEvidence {
     origin: string
     asset_type: string
     daily_price_basis: string
+    return_price_basis?: 'adjusted_price_curve' | 'raw_price_curve'
+    corporate_action_accounting?: 'adjustment_only'
     datasets: Record<string, {
       sha256: string; fields: Record<string, string>; rows: number; symbols: number | null
       start: string | null; end: string | null
@@ -1973,7 +2024,15 @@ export interface BacktestEvidence {
     examples: { symbol: string; side: string; signal_date: string; fill_date: string }[]
   }
   limitations: string[]
+  result_summary?: Record<string, number | null>
+  performance?: {
+    phase_ms: Record<string, number>
+    lookahead_check_ms: number
+    lookahead_in_signals_score: boolean
+  }
 }
+
+export type BacktestPriceBasis = 'qfq' | 'hfq' | 'dynamic'
 
 export interface StrategyBacktestResult {
   run_id: string
@@ -2135,6 +2194,32 @@ export interface ExtensionPackagePreview {
   pending_version?: string | null
 }
 
+export interface EngineReleasePreview {
+  manifest: {
+    id: string; version: string; issuer: string; kind: 'backtest-extension' | 'data-provider'
+    license_kind: 'commercial' | 'community'
+    provides: { id: string; kind: string; api_version: number; feature_id?: string | null }[]
+    requires: { target_tags: string[]; engine_version: string }
+  }
+  kid: string; digest: string; revision: string; errors: string[]; state: 'inspected' | 'staged'
+}
+
+export interface EngineReleaseCandidate {
+  id: string; version: string; digest: string; kid: string; state: 'staged' | 'active' | 'previous'
+  generation?: number; rollback_digest?: string | null
+  provider_ids?: string[]
+  license_kind?: 'commercial' | 'community'
+}
+
+export interface ProUninstallRequest { generation: number; digests: string[] }
+
+export interface EngineIdentity { public_key: string; sha256: string; storage: 'system_vault' | 'private_file' }
+export interface EngineLease {
+  extension_id: string; revision: number
+  summary: { license_policy: 'subscription' | 'perpetual_version'; lease_expires_at: string; updates_until: string;
+    usage_until: string | null; generation: number; revocation_epoch: number }
+}
+
 export interface ManagedExtensionPackage {
   id: string
   name: string
@@ -2152,10 +2237,12 @@ export interface ManagedExtensionPackage {
 }
 
 export type ImportCenterPreview =
+  | { kind: 'chart_indicators'; preview: IndicatorImportPreview }
   | { kind: 'resources'; preview: ResourceTransferPreview }
   | { kind: 'backup'; preview: ConfigBackupInspect }
   | { kind: 'source'; preview: SourcePackagePreview }
   | { kind: 'extension'; preview: ExtensionPackagePreview }
+  | { kind: 'engine'; preview: EngineReleasePreview }
   | { kind: 'page'; preview: { filename: string; size: number; digest: string; source: boolean; suggested_id: string } }
 
 export interface PluginDataSourceItem {
@@ -2184,6 +2271,7 @@ export interface PluginDataSourceItem {
   usage_notes?: string[]   // 使用要点 (可选): 各能力规模/节奏, 详情卡以列表展示
   key_manage_url?: string  // Key/账务管理页 (可选): 插件详情展示入口链接
   key_manage_label?: string // 账户入口文案，缺省使用「管理 Key / 查看账户用量」
+  register_url?: string    // 插件详情中的「注册」链接
 }
 
 /** 数据源路由偏好字段 (每个能力一个, 与后端能力注册表一一对应) */
@@ -2268,6 +2356,8 @@ export interface DatasetConfig {
   batch?: number | null
   rpm?: number | null
   response_path: string
+  research_profile?: 'cn.equity.regular.raw.lot100.v1' | 'cn.equity.ex-factor.events.v1'
+    | 'cn.equity.regular.1m.raw.lot100.start.v1' | 'cn.equity.regular.1m.raw.lot100.end.v1' | null
   field_map: Record<string, string>
   transforms?: Record<string, string>
   symbols_param?: string
@@ -2352,6 +2442,8 @@ export interface DefinitionsCatalogItem {
   id: string
   label: string
   enabled?: boolean
+  /** 已归档 (可逆): 选择器默认隐藏, 正被引用的仍显示 */
+  archived?: boolean
   timeframe?: string
   lang: string
   status?: string
@@ -2412,6 +2504,9 @@ export interface ConfigBackupApplyResult {
 }
 
 export interface Preferences {
+  /** 个股详情日 K 首屏显示根数 */
+  stock_preview_daily_bars?: number
+  stock_info_bar_layout?: StockInfoBarLayout | null
   realtime_quotes_enabled: boolean
   watchlist_groups_in_nav: boolean
   minute_sync_enabled: boolean
@@ -2478,6 +2573,8 @@ export interface Preferences {
   webhook_default_channels?: string[]
   nav_order: string[]
   nav_hidden: string[]
+  nav_layout?: NavLayout | null
+  ui_prefs?: Record<string, string | number | boolean>
   /** 看板自定义布局; null/缺省 = 未自定义(前端内置默认布局) */
   dashboard_layout: { v: number; items: Array<{ i: string; t: string; x: number; y: number; w: number; h: number; p?: Record<string, string> }> } | null
   screener_auto_run: boolean
@@ -2759,6 +2856,50 @@ export interface LabReport {
 export const api = {
   health: () => request<{ status: string; version: string; mode: string }>('/health'),
 
+  engineJobSchema: () => request<Record<string, unknown>>('/api/engine-jobs/schema'),
+  engineInputs: () => request<EngineInputCatalog>('/api/engine-jobs/inputs', { quiet: true }),
+  enginePriceViews: () => request<EnginePriceChoice[]>('/api/engine-jobs/price-views', { quiet: true }),
+  saveEnginePriceVariant: (body: EnginePriceVariant) =>
+    request<{ input: EngineInputCatalog['runs'][number]; snapshot: string }>('/api/engine-jobs/inputs/price-variants', {
+      method: 'POST', body: JSON.stringify(body), quiet: true, timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
+    }),
+  previewEngineJob: (body: EngineJobRequest) => request<EngineJobPreview>('/api/engine-jobs/preview', {
+    method: 'POST', body: JSON.stringify(body), quiet: true,
+  }),
+  engineJobs: (limit = 50) => request<{ items: EngineJobRecord[] }>(`/api/engine-jobs?limit=${limit}`, { quiet: true }),
+  engineScheduleSchema: () => request<Record<string, unknown>>('/api/engine-jobs/schedules/schema', { quiet: true }),
+  engineSchedules: (limit = 50) => request<{ items: EngineScheduleRecord[] }>(`/api/engine-jobs/schedules?limit=${limit}`, { quiet: true }),
+  engineSchedule: (id: string) => request<EngineScheduleRecord>(`/api/engine-jobs/schedules/${encodeURIComponent(id)}`, { quiet: true }),
+  engineScheduleCalendar: (id: string) => request<EngineScheduleCalendar>(`/api/engine-jobs/schedules/${encodeURIComponent(id)}/calendar`, { quiet: true }),
+  engineCalendarPresets: () => request<{ items: EngineCalendarPreset[] }>('/api/engine-jobs/schedules/calendar-presets', { quiet: true }),
+  createEngineSchedule: (body: EngineScheduleRequest) => request<EngineScheduleRecord>('/api/engine-jobs/schedules', {
+    method: 'POST', body: JSON.stringify(body), quiet: true,
+  }),
+  setEngineScheduleEnabled: (id: string, enabled: boolean) => request<EngineScheduleRecord>(`/api/engine-jobs/schedules/${encodeURIComponent(id)}/enabled`, {
+    method: 'POST', body: JSON.stringify({ enabled }), quiet: true,
+  }),
+  engineScheduleDeliveries: (id: string, limit = 50) => request<{ items: EngineScheduleDelivery[] }>(`/api/engine-jobs/schedules/${encodeURIComponent(id)}/deliveries?limit=${limit}`, { quiet: true }),
+  engineJob: (id: string) => request<EngineJobRecord>(`/api/engine-jobs/${encodeURIComponent(id)}`, { quiet: true }),
+  engineJobPlan: (id: string) => request<EngineJobPlan>(`/api/engine-jobs/${encodeURIComponent(id)}/plan`, { quiet: true }),
+  submitEngineJob: (body: EngineJobRequest, expectedPlanId?: string) => request<EngineJobRecord>(
+    `/api/engine-jobs${expectedPlanId ? `?expected_plan_id=${encodeURIComponent(expectedPlanId)}` : ''}`, {
+    method: 'POST', body: JSON.stringify(body), quiet: true,
+  }),
+  cancelEngineJob: (id: string) => request<EngineJobRecord>(`/api/engine-jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST', quiet: true }),
+  retryEngineJob: (id: string) => request<EngineJobRecord>(`/api/engine-jobs/${encodeURIComponent(id)}/retry`, { method: 'POST', quiet: true }),
+  engineJobReport: (id: string, nodeId: string) => request<EngineResearchReport>(
+    `/api/engine-jobs/${encodeURIComponent(id)}/reports/${encodeURIComponent(nodeId)}`,
+    { quiet: true },
+  ),
+  engineJobResultZip: (id: string, nodeId: string) => request<Blob>(
+    `/api/engine-jobs/${encodeURIComponent(id)}/results/${encodeURIComponent(nodeId)}.zip`,
+    { quiet: true, responseType: 'blob', timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS },
+  ),
+  engineJobSnapshot: (id: string, nodeId: string) => request<EngineSnapshotSummary>(
+    `/api/engine-jobs/${encodeURIComponent(id)}/snapshots/${encodeURIComponent(nodeId)}`,
+    { quiet: true },
+  ),
+
   // ===== Auth (访问认证) =====
   authStatus: () =>
     request<{ configured: boolean; authenticated: boolean }>('/api/auth/status'),
@@ -2807,15 +2948,28 @@ export const api = {
     request<{ ok: boolean }>('/api/settings/ai', { method: 'DELETE' }),
 
   /** 草稿连通性测试 — 只验证当前表单值, 不保存任何配置 */
-  testAiSettings: (
+  testAiSettings: async (
     ai: { provider?: string; base_url?: string; api_key?: string; model?: string; protocol?: string },
     opts?: { timeoutMs?: number },
-  ) =>
-    request<{ ok: boolean; model?: string; response?: string; error?: string; error_type?: string }>('/api/settings/ai/test', {
-      method: 'POST',
-      body: JSON.stringify(ai),
-      ...(opts?.timeoutMs != null ? { timeoutMs: opts.timeoutMs } : {}),
-    }),
+  ) => {
+    const invalidResponse = 'AI 连接测试未收到有效的后端响应。请确认前后端版本一致，重启 TSP 后刷新页面，并检查代理是否将 /api 请求转发到 TSP 后端。'
+    try {
+      const result = await request<{ ok: boolean; model?: string; response?: string; error?: string; error_type?: string }>('/api/settings/ai/test', {
+        method: 'POST',
+        body: JSON.stringify(ai),
+        quiet: true,
+        ...(opts?.timeoutMs != null ? { timeoutMs: opts.timeoutMs } : {}),
+      })
+      if (typeof result?.ok !== 'boolean') throw new ApiError(invalidResponse, 502)
+      return result
+    } catch (error) {
+      if (error instanceof ApiError && (error.status === 404 || error.status === 405)) {
+        throw new ApiError(`AI 连接测试接口不可用（HTTP ${error.status}）。请确认前后端版本一致，完整升级并重启 TSP 后刷新页面。使用代理时，请确认 POST /api/settings/ai/test 转发到 TSP 后端。`, error.status)
+      }
+      if (error instanceof SyntaxError) throw new ApiError(invalidResponse, 502)
+      throw error
+    }
+  },
 
   upgradeGuardStatus: () => request<UpgradeGuardStatus>('/api/upgrade-guard/status'),
   upgradeGuardScan: () => request<UpgradeGuardStatus>('/api/upgrade-guard/scan', { method: 'POST' }),
@@ -2847,12 +3001,74 @@ export const api = {
     }),
 
   preferences: () => request<Preferences>('/api/settings/preferences'),
+  updateStockPreviewDailyBars: (bars: number) =>
+    request<{ stock_preview_daily_bars: number }>('/api/settings/preferences/stock-preview', {
+      method: 'PUT', body: JSON.stringify({ stock_preview_daily_bars: bars }), quiet: true,
+    }),
+  updateStockInfoBarLayout: (layout: StockInfoBarLayout, onlyIfUnset = false) =>
+    request<{ stock_info_bar_layout: StockInfoBarLayout }>(
+      '/api/settings/preferences/stock-info-bar' + (onlyIfUnset ? '?only_if_unset=true' : ''),
+      { method: 'PUT', body: JSON.stringify(layout), quiet: true },
+    ),
+  chartIndicatorLibrary: () => request<IndicatorLibraryResponse>('/api/chart-indicators/library', { quiet: true }),
+  compileChartIndicator: (definition: ChartIndicatorDefinition, signal?: AbortSignal) =>
+    request<{ valid: boolean; warmup: number; dependencies: string[] }>('/api/chart-indicators/compile', { method: 'POST', body: JSON.stringify(definition), signal, quiet: true }),
+  exportChartIndicators: (ids: string[], revision: string) => request<Blob>('/api/chart-indicators/export', {
+    method: 'POST', body: JSON.stringify({ ids, revision }), responseType: 'blob', quiet: true,
+  }),
+  importChartIndicators: (packageData: IndicatorPackage, selected: string[], overwrite: string[], revision: string) =>
+    request<IndicatorLibraryResponse>('/api/chart-indicators/import', {
+      method: 'POST', body: JSON.stringify({ package: packageData, selected, overwrite, revision }), quiet: true,
+    }),
+  saveChartIndicatorLibrary: (library: ChartIndicatorLibrary, revision: string) =>
+    request<IndicatorLibraryResponse>('/api/chart-indicators/library', { method: 'PUT', body: JSON.stringify({ library, revision }), quiet: true }),
+  evaluateChartIndicators: async (body: IndicatorEvaluationRequest, signal?: AbortSignal) => {
+    const controller = new AbortController()
+    const cancel = () => controller.abort()
+    const timer = window.setTimeout(cancel, 15_000)
+    if (signal?.aborted) cancel()
+    signal?.addEventListener('abort', cancel, { once: true })
+    try {
+      return await request<IndicatorEvaluation>('/api/chart-indicators/evaluate', {
+        method: 'POST', body: JSON.stringify(body), signal: controller.signal, quiet: true,
+      })
+    } finally {
+      window.clearTimeout(timer)
+      signal?.removeEventListener('abort', cancel)
+    }
+  },
+
   importCenterInspect: (files: File[]) => {
     const body = new FormData()
     files.forEach(file => body.append('files', file))
     return request<ImportCenterPreview>('/api/import-center/inspect', { method: 'POST', body, quiet: true, timeoutMs: 120_000 })
   },
   extensionPackages: () => request<ManagedExtensionPackage[]>('/api/extension-packages'),
+  engineReleaseCandidates: () => request<EngineReleaseCandidate[]>('/api/engine-extension-packages', { quiet: true }),
+  engineLicenses: () => request<{ identity: EngineIdentity | null; leases: EngineLease[] }>('/api/engine-licenses', { quiet: true }),
+  createEngineIdentity: () => request<EngineIdentity>('/api/engine-licenses/identity', { method: 'POST', quiet: true }),
+  importEngineLicense: (digest: string, file: File, revision: number) => {
+    const body = new FormData()
+    body.append('file', file)
+    body.append('revision', String(revision))
+    return request<EngineLease>('/api/engine-extension-packages/' + encodeURIComponent(digest) + '/license',
+      { method: 'POST', body, quiet: true })
+  },
+  switchEngineRelease: (digest: string, operation: 'activate' | 'rollback' | 'disable', generation: number) =>
+    request<{ id: string; active_digest: string | null; generation: number }>(
+      '/api/engine-extension-packages/' + encodeURIComponent(digest) + '/switch',
+      { method: 'POST', body: JSON.stringify({ operation, generation }), quiet: true }),
+  uninstallProDynamic: (body: ProUninstallRequest) =>
+    request<{ id: string; removed: number }>('/api/engine-extension-packages/pro-dynamic/uninstall', {
+      method: 'POST', body: JSON.stringify(body), quiet: true,
+    }),
+  stageEngineRelease: (file: File, digest: string, revision: string) => {
+    const body = new FormData()
+    body.append('file', file)
+    body.append('digest', digest)
+    body.append('revision', revision)
+    return request<EngineReleasePreview>('/api/engine-extension-packages/stage', { method: 'POST', body, quiet: true })
+  },
   installExtensionPackage: (file: File, digest: string, revision: string) => {
     const body = new FormData()
     body.append('file', file); body.append('digest', digest); body.append('revision', revision); body.append('trusted', 'true')
@@ -3240,6 +3456,10 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ nav_order }),
     }),
+  saveNavLayout: (nav_layout: NavLayout | null, nav_hidden: string[]) =>
+    request<{ nav_layout: NavLayout | null; nav_order: string[]; nav_hidden: string[] }>('/api/settings/preferences/nav-layout', {
+      method: 'PUT', body: JSON.stringify({ nav_layout, nav_hidden }),
+    }),
   saveNavHidden: (nav_hidden: string[]) =>
     request<{ nav_hidden: string[] }>('/api/settings/preferences/nav-hidden', {
       method: 'PUT',
@@ -3430,10 +3650,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ symbol, ...(days != null ? { days } : {}) }),
     }),
-  repairMinuteGaps: (symbols: string[]) =>
+  repairMinuteGaps: (targets: Pick<MinuteGapRow, 'symbol' | 'date'>[] | string[]) =>
     request<{ status: string; job_id: string }>('/api/kline/repair_minute_gaps', {
       method: 'POST',
-      body: JSON.stringify({ symbols }),
+      body: JSON.stringify(typeof targets[0] === 'string' ? { symbols: targets } : { targets }),
     }),
   clearMinute: () =>
     request<{ status: string; removed: number }>('/api/kline/clear_minute', {
@@ -3502,6 +3722,11 @@ export const api = {
     request<{ symbols: WatchlistEntry[] }>(
       `/api/watchlist/${encodeURIComponent(symbol)}/group`,
       { method: 'PUT', body: JSON.stringify({ group_id: groupId }) },
+    ),
+  watchlistGroupTransfer: (source: string, target: string, symbols: string[], action: 'move' | 'copy') =>
+    request<{ symbols: WatchlistEntry[]; changed: number }>(
+      `/api/watchlist/groups/${encodeURIComponent(source)}/transfer`,
+      { method: 'POST', body: JSON.stringify({ target_group_id: target, symbols, action }), quiet: true },
     ),
   watchlistGroupAddMember: (groupId: string, symbol: string) =>
     request<{ symbols: WatchlistEntry[] }>(
@@ -3783,6 +4008,13 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ group }) },
     ),
 
+  /** 归档/恢复因子 (可逆): 只改标记位, 不注销注册表 */
+  factorArchive: (factorId: string, archived: boolean) =>
+    request<{ ok: boolean; id: string; archived: boolean }>(
+      `/api/factors/custom/${encodeURIComponent(factorId)}/${archived ? 'archive' : 'unarchive'}`,
+      { method: 'POST' },
+    ),
+
   factorRun: (payload: {
     factor_name: string
     symbols?: string[] | null
@@ -3946,6 +4178,7 @@ export const api = {
     position_policy_params?: Record<string, number | boolean | string> | null
     asset_type?: 'stock' | 'etf' | 'index'
     minute_fill?: boolean
+    price_basis?: BacktestPriceBasis
   }) =>
     request<StrategyBacktestResult>('/api/backtest/strategy/run', {
       method: 'POST',
@@ -4301,6 +4534,8 @@ export const api = {
     url: string; method?: string; headers?: Record<string, string>; body?: string;
     response_path?: string; field_map?: Record<string, string>;
     schedule_minutes?: number; enabled?: boolean;
+    /** 间隔秒数 (10~2592000): 配置后优先于 schedule_minutes; null=沿用分钟值 */
+    schedule_seconds?: number | null;
     schedule_time?: string | null;
     schedule_period?: 'daily' | 'weekly' | 'monthly' | null;
     schedule_day?: number | null;
@@ -4787,6 +5022,64 @@ export const api = {
   strategyReload: () =>
     request<{ ok: boolean; count: number }>('/api/strategies/reload', { method: 'POST' }),
 
+  // ===== Strategy Pool v2 (池成员 / 策略库分组与归档) =====
+  strategyPoolSnapshot: (signal?: AbortSignal) =>
+    request<StrategyPoolSnapshot>('/api/strategy-pool', { signal }),
+
+  /** 池的整体替换 (纯 ID 顺序; 已归档策略会被后端拒绝) */
+  strategyPoolSetEntries: (ids: string[], onlyIfEmpty = false, expectedRevision?: number) =>
+    request<StrategyPoolSnapshot>('/api/strategy-pool/entries', {
+      method: 'PUT',
+      body: JSON.stringify({ pool: ids, only_if_empty: onlyIfEmpty, expected_revision: expectedRevision }),
+    }),
+
+  strategyPoolAdd: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/entries/${encodeURIComponent(strategyId)}`, { method: 'POST' }),
+
+  strategyPoolRemove: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/entries/${encodeURIComponent(strategyId)}`, { method: 'DELETE' }),
+
+  /** 归档策略 (库级, 可逆): 移入档案库并移出池; 不删除策略文件 */
+  strategyPoolArchiveStrategy: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/archive`, { method: 'POST' }),
+
+  /** 恢复策略: 回到策略库 (不自动回池) */
+  strategyPoolUnarchiveStrategy: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/unarchive`, { method: 'POST' }),
+
+  /** 删除策略的库级记录 (清理档案库中已删除的策略) */
+  strategyPoolDiscardRecord: (strategyId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/record`, { method: 'DELETE' }),
+
+  /** 设置策略的自定义分组 (null = 未分组) */
+  strategyPoolSetStrategyGroup: (strategyId: string, group: string | null) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/strategies/${encodeURIComponent(strategyId)}/group`, {
+      method: 'POST',
+      body: JSON.stringify({ group }),
+    }),
+
+  strategyPoolCreateGroup: (name: string) =>
+    request<StrategyPoolSnapshot & { group: StrategyPoolGroup }>('/api/strategy-pool/groups', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+
+  strategyPoolRenameGroup: (groupId: string, name: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/groups/${encodeURIComponent(groupId)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name }),
+    }),
+
+  strategyPoolReorderGroups: (orderedIds: string[]) =>
+    request<StrategyPoolSnapshot>('/api/strategy-pool/groups/reorder', {
+      method: 'PUT',
+      body: JSON.stringify({ ordered_ids: orderedIds }),
+    }),
+
+  /** 删除分组定义; 组内策略保留转未分组 */
+  strategyPoolDeleteGroup: (groupId: string) =>
+    request<StrategyPoolSnapshot>(`/api/strategy-pool/groups/${encodeURIComponent(groupId)}`, { method: 'DELETE' }),
+
   // ===== Custom Signals (自定义信号) =====
   customSignalsList: () =>
     request<{ signals: CustomSignal[] }>('/api/custom-signals'),
@@ -4802,6 +5095,10 @@ export const api = {
 
   customSignalDelete: (id: string) =>
     request<{ ok: boolean }>(`/api/custom-signals/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  /** 归档/恢复信号 (可逆): 只改标记位, 不影响编译注入 */
+  customSignalArchive: (id: string, archived: boolean) =>
+    request<{ ok: boolean; signal: CustomSignal }>(`/api/custom-signals/${encodeURIComponent(id)}/${archived ? 'archive' : 'unarchive'}`, { method: 'POST' }),
 
   customSignalsAiGenerate: (description: string) =>
     request<CustomSignalAIGenerateResult>('/api/custom-signals/ai/generate', {
@@ -4984,7 +5281,7 @@ export const api = {
 
   /** 检查 AI 配置状态 */
   strategyAiStatus: () =>
-    request<{ configured: boolean; has_key: boolean; has_model: boolean; provider?: string }>('/api/strategies/ai/status'),
+    request<{ configured: boolean; has_key: boolean; has_model: boolean; provider?: string; supports_tools?: boolean }>('/api/strategies/ai/status'),
 
   /** 测试 AI 连通性 */
   strategyAiTest: () =>
@@ -5116,6 +5413,8 @@ export interface PipelineJob {
     enriched_days?: number
     index_count?: number
     index_daily_rows?: number
+    requested_gaps?: number
+    remaining_gaps?: number
     minute_rows?: number
     skipped_stages?: string[]
   } | null
@@ -5259,6 +5558,8 @@ export interface PullConfig {
   response_path: string
   field_map?: Record<string, string>
   schedule_minutes: number
+  /** 间隔秒数 (10~2592000): 配置后优先于 schedule_minutes 生效; null/缺省=分钟制 */
+  schedule_seconds?: number | null
   enabled: boolean
   /** 每日固定拉取时刻 "HH:MM" (北京时间): 配置后忽略间隔, 每天该时刻拉一次; null=间隔制 */
   schedule_time?: string | null
@@ -5369,6 +5670,7 @@ export interface ExtDataConfig {
   id: string
   label: string
   mode: 'snapshot' | 'timeseries'
+  market_level?: boolean
   fields: ExtDataField[]
   description?: string
   symbol_map?: Record<string, string>

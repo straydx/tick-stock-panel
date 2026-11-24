@@ -3,14 +3,17 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Download, Loader2, RefreshCw } from 'lucide-react'
 import { api, type MinuteKlineSession } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
+import { mergeMinuteRows } from '@/lib/minuteBatchIncremental'
 import { klineMinuteQueryOptions, klineMinuteRangeQueryOptions, minuteRefetchInterval } from '@/lib/kline'
 import { toast } from '@/components/Toast'
 import type { ChartRenderer } from '@/lib/chart-types'
 
 const EChartsMultiDayIntraday = lazy(() => import('./EChartsMultiDayIntraday').then(m => ({ default: m.EChartsMultiDayIntraday })))
 const LightweightIntraday = lazy(() => import('./charts/LightweightIntraday').then(m => ({ default: m.LightweightIntraday })))
+const CustomIntraday = lazy(() => import('./charts/CustomChart').then(m => ({ default: m.CustomIntraday })))
 
 interface Props {
+  customIndicators?: boolean
   symbol: string
   renderer?: ChartRenderer
   days: number
@@ -27,6 +30,7 @@ function errorMessage(error: unknown): string {
 export function StockMultiDayIntradayChart({
   symbol,
   renderer = 'echarts',
+  customIndicators = false,
   days,
   height = 420,
   refetchIntervalMs,
@@ -59,7 +63,7 @@ export function StockMultiDayIntradayChart({
         byDate.set(latestDate, {
           date: latestDate,
           prev_close: latest.data?.prev_close ?? existing?.prev_close ?? null,
-          rows: latestRows,
+          rows: existing ? mergeMinuteRows(existing.rows, latestRows) : latestRows,
         })
       }
     }
@@ -75,7 +79,7 @@ export function StockMultiDayIntradayChart({
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['kline-minute-range', symbol] }),
         queryClient.invalidateQueries({ queryKey: ['kline-minute', symbol] }),
-        queryClient.invalidateQueries({ queryKey: QK.minuteBatch() }),
+        queryClient.resetQueries({ queryKey: QK.minuteBatch(), exact: true }),
       ])
     },
     onError: (e: Error) => {
@@ -100,6 +104,10 @@ export function StockMultiDayIntradayChart({
   const missingDays = Math.max(0, days - localSessionCount)
   const showCoverage = !history.isPlaceholderData && sessions.length > 0 && missingDays > 0 && !isIndex
 
+  const partialDates = history.isPlaceholderData ? [] : (history.data?.sessions ?? [])
+    .filter(session => session.partial && sessions.some(s => s.date === session.date))
+    .map(session => session.date)
+
   // 自动补齐: 本地落库天数不足且非指数时, 自动触发同步
   // 用 ref 记录已触发的 symbol:days, 避免重复; 失败后清标记, 允许上限内自动重试
   const autoSyncRef = useRef<string | null>(null)
@@ -117,8 +125,9 @@ export function StockMultiDayIntradayChart({
     syncMinute.mutate()
   }, [symbol, days, localSessionCount, loading, isIndex, history.error, history.isPlaceholderData, syncMinute.isPending])
 
-  const chartHeight = Math.max(260, height - (showCoverage || syncMinute.isPending ? 32 : 0))
-  const Chart = renderer === 'lightweight' ? LightweightIntraday : EChartsMultiDayIntraday
+  const chartHeight = Math.max(260, height - (showCoverage || syncMinute.isPending ? 32 : 0) - (partialDates.length ? 32 : 0))
+  const customChart = renderer === 'lightweight' && customIndicators
+  const Chart = customChart ? CustomIntraday : renderer === 'lightweight' ? LightweightIntraday : EChartsMultiDayIntraday
 
   if (loading) {
     return (
@@ -202,8 +211,14 @@ export function StockMultiDayIntradayChart({
           )}
         </div>
       )}
+      {partialDates.length > 0 && (
+        <div className="flex h-8 items-center border-b border-border/60 px-3 text-[11px] text-warning">
+          <span className="truncate" title={partialDates.join('、')}>本地历史分时不完整：{partialDates.join('、')}</span>
+        </div>
+      )}
       <Suspense fallback={<div className="text-xs text-muted py-4">正在加载图表…</div>}>
       <Chart
+        {...(customChart ? { indicatorRevision: `${history.dataUpdatedAt}:${latest.dataUpdatedAt}` } : {})}
         assetType={history.data?.asset_type ?? latest.data?.asset_type}
         {...(renderer === 'lightweight' ? {
           priceLimit: sessions.length === 1 && sessions[0].date === latest.data?.date ? latest.data?.price_limit ?? undefined : undefined,

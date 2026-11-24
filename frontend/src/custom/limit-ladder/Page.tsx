@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useLocation } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { RefreshCw, ChevronDown, Flame, Settings2, X, Bell, BellOff, AlertCircle } from 'lucide-react'
 import { DatePicker } from '@/components/DatePicker'
@@ -239,6 +240,7 @@ const StockCard = React.memo(function StockCard({ stock, extFields, direction, s
   const [showMonitorMenu, setShowMonitorMenu] = useState(false)
   const [menuAnchor, setMenuAnchor] = useState<DOMRect | null>(null)
   const code = stock.symbol.replace(/\.BJ$/, '').replace(/\.SZ$/, '').replace(/\.SH$/, '')
+  const name = stock.name?.trim() || undefined
   const tag = boardTag(stock.symbol)
   const status = stock.status || (direction === 'down' ? 'limit_down' : 'limit_up')
   const style = STATUS_STYLE[status] || STATUS_STYLE[direction === 'down' ? 'limit_down' : 'limit_up']
@@ -296,11 +298,11 @@ const StockCard = React.memo(function StockCard({ stock, extFields, direction, s
       <div
       role="button"
       tabIndex={0}
-      onClick={() => onClick(stock.symbol, stock.name ?? undefined)}
+      onClick={() => onClick(stock.symbol, name)}
       onKeyDown={event => {
         if (event.key !== 'Enter' && event.key !== ' ') return
         event.preventDefault()
-        onClick(stock.symbol, stock.name ?? undefined)
+        onClick(stock.symbol, name)
       }}
       className={`w-full flex flex-col items-start gap-1 px-2.5 py-2 rounded-md transition-all duration-200 cursor-pointer hover:opacity-100 ${style.bg} ${style.bar} ${monitored ? 'ring-1 ring-amber-400/50 ring-inset' : ''} ${active ? 'ring-1 ring-accent/60 ring-inset' : ''}`}
       style={style.cardStyle ? { ...style.cardStyle } : undefined}
@@ -315,7 +317,10 @@ const StockCard = React.memo(function StockCard({ stock, extFields, direction, s
     >
       {/* 名称行 */}
       <div className="flex items-center gap-1.5 w-full min-w-0 pr-4">
-        <span className={`${style.nameCls} font-medium truncate`}>{stock.name}</span>
+        <span className={`${style.nameCls} font-medium truncate`}
+          title={name ? undefined : '名称数据缺失，请同步标的信息'}>
+          {name || '名称待同步'}
+        </span>
         {stock.is_one_word && (
           <span className={`shrink-0 rounded-sm border px-1 py-px text-[9px] font-medium leading-none ${
             direction === 'down'
@@ -729,13 +734,15 @@ function filterTiers(tiers: LimitLadderTier[], keys: Set<FilterKey>, bf?: Broken
 
 // ===== 过滤持久化 =====
 
-const DEFAULT_FILTERS = new Set<FilterKey>(['limit_up', 'main', 'chinext', 'star', 'bj'])
+function defaultFilterKeys(direction: Direction): Set<FilterKey> {
+  return new Set([direction === 'down' ? 'limit_down' : 'limit_up', 'main', 'chinext', 'star', 'bj'])
+}
 
 function loadFilterKeys(): Set<FilterKey> {
   const arr = storage.limitLadderBoard.get([])
   const allTabs = [...STATUS_TABS_UP, ...BOARD_TABS]
   const valid = arr.filter((k): k is FilterKey => allTabs.some(t => t.key === k))
-  return valid.length > 0 ? new Set(valid) : new Set(DEFAULT_FILTERS)
+  return valid.length > 0 ? new Set(valid) : defaultFilterKeys('up')
 }
 
 // ===== 梯队颜色 =====
@@ -1458,10 +1465,19 @@ function ExtConfigDialog({ fields, onSave, onClose }: {
 // ===== 主页面 =====
 
 export function LimitUpLadder() {
-  const [asOf, setAsOf] = useState('')
-  const [direction, setDirection] = useState<Direction>(() => storage.limitLadderDirection.get('up'))
+  const { search } = useLocation()
+  return <LimitLadderView key={search} search={search} />
+}
+
+function LimitLadderView({ search }: { search: string }) {
+  const params = new URLSearchParams(search)
+  const requestedDate = params.get('date') ?? ''
+  const requestedDirection = params.get('direction')
+  const entryDirection = requestedDirection === 'up' || requestedDirection === 'down' ? requestedDirection : undefined
+  const [asOf, setAsOf] = useState(/^\d{4}-\d{2}-\d{2}$/.test(requestedDate) ? requestedDate : '')
+  const [direction, setDirection] = useState<Direction>(() => entryDirection ?? storage.limitLadderDirection.get('up'))
   const [sealMode, setSealMode] = useState<'vol' | 'amount'>(() => storage.limitLadderSealMode.get('vol'))
-  const [filterKeys, setFilterKeys] = useState<Set<FilterKey>>(loadFilterKeys)
+  const [filterKeys, setFilterKeys] = useState<Set<FilterKey>>(() => entryDirection ? defaultFilterKeys(entryDirection) : loadFilterKeys())
   const [extFields, setExtFields] = useState<ExtFieldConfig>(loadExtFields)
   const [showExtConfig, setShowExtConfig] = useState(false)
   const [showConcept, setShowConcept] = useState(() => storage.limitLadderShowExt.get({ concept: true, industry: true }).concept)
@@ -1489,13 +1505,9 @@ export function LimitUpLadder() {
     setDirection(d)
     storage.limitLadderDirection.set(d)
     // 切换方向时重置状态筛选为该方向默认集(避免涨跌状态键错配)
-    const defaultKeys = d === 'down'
-      ? ['limit_down', 'main', 'chinext', 'star', 'bj']
-      : ['limit_up', 'main', 'chinext', 'star', 'bj']
-    const allTabs = [...statusTabs(d), ...BOARD_TABS]
-    const valid = defaultKeys.filter(k => allTabs.some(t => t.key === k)) as FilterKey[]
-    setFilterKeys(new Set(valid))
-    storage.limitLadderBoard.set(valid)
+    const defaults = defaultFilterKeys(d)
+    setFilterKeys(defaults)
+    storage.limitLadderBoard.set([...defaults])
   }, [])
 
   const toggleConcept = useCallback(() => {

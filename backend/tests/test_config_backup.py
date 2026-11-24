@@ -131,6 +131,119 @@ def _zip_entries(data: bytes) -> dict[str, bytes]:
         return {name: zf.read(name) for name in zf.namelist()}
 
 
+def test_strategy_library_backup_roundtrip_and_conflict_policy(src_env, tmp_path, monkeypatch):
+    from app.config import settings
+    from app.services import strategy_pool
+
+    _, group = strategy_pool.create_group("长期观察")
+    strategy_pool.set_pool(["custom_demo", "custom_withdep"])
+    strategy_pool.set_strategy_group("custom_demo", group["id"])
+    strategy_pool.archive("custom_withdep")
+    original = strategy_pool.load_snapshot()
+    data, _ = config_backup.build_backup(categories=["strategy_pool"])
+    assert "user_data/strategy_pool.json" in _zip_entries(data)
+    assert config_backup.inspect_archive(data)["categories"][0]["key"] == "strategy_pool"
+
+    destination = tmp_path / "restored"
+    monkeypatch.setattr(settings, "data_dir", destination)
+    result = config_backup.apply_archive(data)
+    assert result["categories"][0]["imported"] == 1
+    restored = strategy_pool.load_snapshot()
+    for key in ("pool", "groups", "meta"):
+        assert restored[key] == original[key]
+    assert strategy_pool.load_snapshot() == restored  # 重启式读取不漂移
+
+    strategy_pool.add("new_local")
+    result = config_backup.apply_archive(data)
+    assert result["categories"][0]["skipped_conflict"] == 1
+    assert "new_local" in strategy_pool.load_snapshot()["pool"]
+    result = config_backup.apply_archive(data, allow_overwrite=True)
+    assert result["categories"][0]["imported"] == 1
+    assert strategy_pool.load_snapshot()["pool"] == original["pool"]
+
+
+@pytest.mark.parametrize("payload", [
+    {"version": 99, "groups": [], "pool": [], "meta": {}},
+    {"version": 2, "groups": [], "pool": "invalid", "meta": {}},
+    {"version": 2, "groups": [], "pool": [], "meta": []},
+])
+def test_invalid_strategy_library_restore_preserves_existing(src_env, payload):
+    from app.services import strategy_pool
+
+    strategy_pool.add("keep_me")
+    path = src_env / "user_data/strategy_pool.json"
+    before = path.read_bytes()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"format": config_backup.BACKUP_FORMAT, "version": 1}))
+        zf.writestr("user_data/strategy_pool.json", json.dumps(payload))
+    result = config_backup.apply_archive(buf.getvalue(), allow_overwrite=True)
+    assert result["categories"][0]["failed"]
+    assert path.read_bytes() == before
+
+
+def test_archive_flags_remain_in_factor_and_signal_backup(src_env):
+    for directory, name in (("custom_factors", "uf_demo"), ("custom_signals", "cs_demo")):
+        path = src_env / "user_data" / directory / f"{name}.json"
+        doc = json.loads(path.read_text())
+        doc.update(archived=True, archived_at="2026-11-08T10:00:00")
+        path.write_text(json.dumps(doc), encoding="utf-8")
+    entries = _zip_entries(config_backup.build_backup()[0])
+    for name in ("custom_factors/uf_demo", "custom_signals/cs_demo"):
+        assert json.loads(entries[f"user_data/{name}.json"])["archived"] is True
+
+
+def test_old_backups_preserve_library_and_v1_library_restore_is_supported(src_env):
+    from app.services import strategy_pool
+
+    strategy_pool.add("local")
+    before = strategy_pool.load_snapshot()
+    # 已发布版本的备份不包含新文件, 导入它不能把本机策略库清空。
+    old_backup, _ = config_backup.build_backup(categories=["preferences"])
+    config_backup.apply_archive(old_backup, allow_overwrite=True)
+    assert strategy_pool.load_snapshot() == before
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"format": config_backup.BACKUP_FORMAT, "version": 1}))
+        zf.writestr("user_data/strategy_pool.json", json.dumps({
+            "version": 1, "groups": [{"id": "g", "name": "旧分组"}],
+            "entries": [{"id": "a", "group": "g", "added_at": "2025-01-01"}],
+            "archived": [{"id": "b", "group": "g", "archived_at": "2025-02-01"}],
+        }))
+        zf.writestr("user_data/preferences.json", json.dumps({"ui_prefs": {"strategy_pool": '["stale"]'}}))
+    result = config_backup.apply_archive(buf.getvalue(), allow_overwrite=True)
+    assert not any(category["failed"] for category in result["categories"])
+    state = strategy_pool.load_snapshot()
+    assert state["pool"] == ["a"]
+    assert state["meta"]["b"]["archived"] is True
+    assert state["meta"]["a"]["added_at"] == "2025-01-01"
+    from app.services import preferences
+
+    assert json.loads(preferences.get_ui_prefs()["strategy_pool"]) == ["a"]
+
+
+def test_legacy_pool_import_requires_overwrite_and_keeps_group_and_archive_metadata(src_env):
+    from app.services import strategy_pool
+
+    _, group = strategy_pool.create_group("保留分组")
+    strategy_pool.set_strategy_group("local", group["id"])
+    strategy_pool.add("local")
+    strategy_pool.archive("archived")
+    before_meta = strategy_pool.load_snapshot()["meta"]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("manifest.json", json.dumps({"format": config_backup.BACKUP_FORMAT, "version": 1}))
+        zf.writestr("user_data/preferences.json", json.dumps({
+            "ui_prefs": {"strategy_pool": '["legacy", "archived"]'},
+        }))
+    config_backup.apply_archive(buf.getvalue())
+    assert strategy_pool.load_snapshot()["pool"] == ["local"]
+    config_backup.apply_archive(buf.getvalue(), allow_overwrite=True)
+    assert strategy_pool.load_snapshot()["pool"] == ["legacy"]
+    assert strategy_pool.load_snapshot()["meta"] == before_meta
+
+
 def test_export_contains_all_categories_and_manifest(src_env):
     data, filename = config_backup.build_backup()
     assert filename.startswith("tsp-config-backup-") and filename.endswith(".zip")
@@ -472,6 +585,127 @@ def test_apply_preferences_merges_not_replaces(src_env):
     assert after["local_only_key"] == "keep"  # 本地新增键保留 (merge 而非整替)
     # 备份导出时已脱敏 → 导入不清掉本地已有敏感键, 也不写入新的
     assert after["feishu_webhook_secret"] == "s3cret"
+
+
+def test_stock_preview_bars_persist_and_roundtrip_in_config_backup(src_env, tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api import settings as settings_api
+    from app.config import settings
+    from app.services import preferences
+
+    monkeypatch.setattr(settings_api, "_realtime_allowed", lambda: False)
+    monkeypatch.setattr(settings_api, "_minute_history_days", lambda: None)
+    app = FastAPI()
+    app.include_router(settings_api.router)
+    path = "/api/settings/preferences"
+    field = "stock_preview_daily_bars"
+    old_backup, _ = config_backup.build_backup(categories=["preferences"])
+    source_stamp = preferences.data_source_stamp()
+    with TestClient(app) as client:
+        assert client.get(path).json()[field] == 60
+        response = client.put(f"{path}/stock-preview", json={field: 85})
+        assert response.status_code == 200
+        assert response.json() == {field: 85}
+        for invalid in (0, True, 5.5, "85", 2**53):
+            assert client.put(f"{path}/stock-preview", json={field: invalid}).status_code == 422
+        assert preferences.data_source_stamp() == source_stamp
+        preferences._invalidate_cache()
+        assert client.get(path).json()[field] == 85
+
+        archive, _ = config_backup.build_backup(categories=["preferences"])
+        backed_up = json.loads(_zip_entries(archive)["user_data/preferences.json"])
+        assert backed_up[field] == 85
+
+        monkeypatch.setattr(settings, "data_dir", tmp_path / "restored")
+        preferences._invalidate_cache()
+        assert client.get(path).json()[field] == 60
+        assert config_backup.apply_archive(archive)["preferences_merged"] is True
+        assert client.get(path).json()[field] == 85
+        config_backup.apply_archive(old_backup)
+        assert client.get(path).json()[field] == 85
+
+
+def test_stock_preview_bars_reject_invalid_backup_before_merging(src_env):
+    from app.services import preferences
+
+    preferences.save({"stock_preview_daily_bars": 0, "quote_interval": 99})
+    archive, _ = config_backup.build_backup(categories=["preferences"])
+    preferences.save({"stock_preview_daily_bars": 85, "quote_interval": 5})
+    with pytest.raises(config_backup.ConfigBackupError, match="日 K 默认显示根数"):
+        config_backup.apply_archive(archive)
+    assert preferences.get_stock_preview_daily_bars() == 85
+    assert preferences.load()["quote_interval"] == 5
+
+
+def test_stock_info_bar_migration_and_backup_roundtrip(src_env, tmp_path, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api import settings as settings_api
+    from app.config import settings
+    from app.services import preferences
+
+    monkeypatch.setattr(settings_api, "_realtime_allowed", lambda: False)
+    monkeypatch.setattr(settings_api, "_minute_history_days", lambda: None)
+    app = FastAPI()
+    app.include_router(settings_api.router)
+    path = "/api/settings/preferences"
+    update = f"{path}/stock-info-bar"
+    key = "stock_info_bar_layout"
+    size = {
+        "id": "builtin:market_cap", "source": {"type": "builtin", "key": "market_cap"},
+        "label": "市值", "visible": True,
+    }
+    sector = {
+        "id": "ext:sector:theme",
+        "source": {"type": "ext", "configId": "sector", "fieldName": "theme", "fieldType": "STRING"},
+        "label": "题材", "visible": True, "standalone": True,
+        "extDisplay": {"displayMode": "tag", "separator": "、", "maxTags": 6, "hiddenIndices": [1]},
+    }
+    legacy = {"fields": [size, sector], "baseline": [size, sector]}
+    edited = {"fields": [{**sector, "visible": False}, size], "baseline": legacy["baseline"]}
+    old_archive, _ = config_backup.build_backup(categories=["preferences"])
+    source_stamp = preferences.data_source_stamp()
+
+    with TestClient(app) as client:
+        assert client.get(path).json()[key] is None
+        assert client.put(f"{update}?only_if_unset=true", json=legacy).json() == {key: legacy}
+        assert client.put(update, json=edited).json() == {key: edited}
+        assert client.put(f"{update}?only_if_unset=true", json=legacy).json() == {key: edited}
+        invalid = {**edited, "fields": [{**sector, "source": {"type": "ext"}}]}
+        assert client.put(update, json=invalid).status_code == 422
+        assert preferences.data_source_stamp() == source_stamp
+        preferences._invalidate_cache()
+        assert client.get(path).json()[key] == edited
+
+        archive, _ = config_backup.build_backup(categories=["preferences"])
+        backed_up = json.loads(_zip_entries(archive)["user_data/preferences.json"])
+        assert backed_up[key] == edited
+
+        monkeypatch.setattr(settings, "data_dir", tmp_path / "info-layout-restored")
+        preferences._invalidate_cache()
+        assert client.get(path).json()[key] is None
+        assert config_backup.apply_archive(archive)["preferences_merged"] is True
+        assert client.get(path).json()[key] == edited
+        config_backup.apply_archive(old_archive)
+        assert client.get(path).json()[key] == edited
+        assert client.get(path).json()["stock_preview_daily_bars"] == 60
+
+
+def test_stock_info_bar_rejects_malformed_backup_before_merging(src_env):
+    from app.services import preferences
+
+    key = "stock_info_bar_layout"
+    preferences.save({key: {"fields": [None], "baseline": []}, "quote_interval": 99})
+    archive, _ = config_backup.build_backup(categories=["preferences"])
+    layout = {"fields": [], "baseline": None}
+    preferences.save({key: layout, "quote_interval": 5})
+    with pytest.raises(config_backup.ConfigBackupError, match="个股信息条配置无效"):
+        config_backup.apply_archive(archive)
+    assert preferences.load()[key] == layout
+    assert preferences.load()["quote_interval"] == 5
 
 
 def test_apply_secrets_via_store(src_env, tmp_path_factory, monkeypatch):

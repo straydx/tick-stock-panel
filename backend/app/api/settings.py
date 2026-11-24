@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app import secrets_store
 from app.data_providers.custom.config import MAX_TIMEOUT
+from app.services.preferences import STOCK_PREVIEW_DAILY_BARS_MAX
+from app.services.stock_info_bar import StockInfoBarLayout
 from app.tickflow import client as tf_client
 from app.tickflow.policy import (
     detect_capabilities,
@@ -589,6 +591,10 @@ class DatasetConfigIn(BaseModel):
     batch: int | None = None
     rpm: int | None = None
     response_path: str = ""
+    research_profile: Literal[
+        "cn.equity.regular.raw.lot100.v1", "cn.equity.ex-factor.events.v1",
+        "cn.equity.regular.1m.raw.lot100.start.v1", "cn.equity.regular.1m.raw.lot100.end.v1",
+    ] | None = None
     field_map: dict[str, str] = {}
     transforms: dict[str, str] = {}
     symbols_param: str = "symbols"
@@ -692,10 +698,13 @@ def get_preferences() -> dict:
         "webhook_enabled_default": preferences.get_webhook_enabled_default(),
         "webhook_default_channels": preferences.get_webhook_default_channels(),
         "minute_intraday_refresh": preferences.get_minute_intraday_refresh(),
+        "stock_preview_daily_bars": preferences.get_stock_preview_daily_bars(),
+        "stock_info_bar_layout": preferences.load().get("stock_info_bar_layout"),
         "minute_intraday_refresh_interval": preferences.get_minute_intraday_refresh_interval(),
         "monitor_ext_fields": preferences.get_monitor_ext_fields(),
         "nav_order": preferences.get_nav_order(),
         "nav_hidden": preferences.get_nav_hidden(),
+        "nav_layout": preferences.get_nav_layout(),
         "dashboard_layout": preferences.get_dashboard_layout(),
         "screener_auto_run": preferences.get_screener_auto_run(),
         "assistant_auto_approve_actions": preferences.get_assistant_auto_approve_actions(),
@@ -1040,6 +1049,23 @@ class NavHiddenIn(BaseModel):
     nav_hidden: list[str]
 
 
+class NavLayoutIn(BaseModel):
+    nav_layout: dict | None
+    nav_hidden: list[str] | None = None
+
+
+@router.put("/preferences/nav-layout")
+def update_nav_layout(req: NavLayoutIn) -> dict:
+    from app.services import preferences
+
+    try:
+        layout = preferences.set_nav_layout(req.nav_layout, req.nav_hidden)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"nav_layout": layout, "nav_order": preferences.get_nav_order(),
+            "nav_hidden": preferences.get_nav_hidden()}
+
+
 @router.put("/preferences/nav-order")
 def update_nav_order(req: NavOrderIn) -> dict:
     """保存左侧菜单排序（内置页面 path + 扩展分析菜单 id 的有序列表）。"""
@@ -1087,6 +1113,36 @@ def get_screener_result_columns() -> dict:
     from app.services import preferences
     cols = preferences.get_screener_result_columns()
     return {"columns": cols}
+
+
+class StockPreviewPrefsIn(BaseModel):
+    stock_preview_daily_bars: int = Field(strict=True, ge=1, le=STOCK_PREVIEW_DAILY_BARS_MAX)
+
+
+@router.put("/preferences/stock-preview")
+def update_stock_preview_preferences(req: StockPreviewPrefsIn) -> dict:
+    """保存个股详情的日 K 首屏根数。"""
+    from app.services import preferences
+
+    updates = req.model_dump()
+    preferences.save(updates)
+    return updates
+
+
+@router.put("/preferences/stock-info-bar")
+def update_stock_info_bar_layout(layout: StockInfoBarLayout, only_if_unset: bool = False) -> dict:
+    """保存个股信息条与默认方案。浏览器旧配置仅在服务端未配置时迁入。"""
+    from app.services import preferences
+
+    key = "stock_info_bar_layout"
+    with preferences.mutation():
+        if only_if_unset:
+            current = preferences.load().get(key)
+            if current is not None:
+                return {key: current}
+        updates = {key: layout.model_dump(by_alias=True, exclude_unset=True)}
+        preferences.save(updates)
+    return updates
 
 
 class UiPrefsIn(BaseModel):
